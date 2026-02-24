@@ -6,6 +6,11 @@ import os
 
 app = FastAPI()
 
+# ---------- ROOT ROUTE FOR HEALTH CHECK ----------
+@app.get("/")
+def root():
+    return {"status": "FastAPI is running"}
+
 # ---------- DATABASE CONNECTION ----------
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -98,14 +103,12 @@ async def receive_sms(
     print(f"Incoming SMS from {phone}: {text}")
 
     student = get_student(phone)
-
-    # If no record, start the flow
     if not student:
         save_student(phone, "state", "LEVEL")
         return "Welcome to Edutena CBE.\nSelect Level:\n1. JSS\n2. Senior"
 
-    state = student[-1]  # state is last column
-    pathway = student[-2]  # pathway is second-to-last column
+    state = student[-1]
+    pathway = student[-2]
 
     # Global CAREERS check
     if text.upper() == "CAREERS":
@@ -118,7 +121,6 @@ async def receive_sms(
         if pathway == "Arts & Sports Science":
             return "1. Design\n2. Music\n3. Sports"
 
-    # STATE FLOW
     try:
         if state == "LEVEL":
             level = "JSS" if text == "1" else "Senior"
@@ -167,7 +169,6 @@ async def receive_sms(
             pathway = calculate_pathway(phone)
             return f"Recommended Pathway:\n{pathway}\nReply CAREERS to see careers"
 
-        # If flow finished but no recognized command
         return "Reply START to begin."
     except Exception as e:
         print("Error processing SMS:", e)
