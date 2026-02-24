@@ -3,8 +3,16 @@ from fastapi.responses import PlainTextResponse
 import psycopg2
 from urllib.parse import urlparse
 import os
+import africastalking
 
 app = FastAPI()
+
+# ---------- Initialize Africa's Talking SDK (once at startup) ----------
+AT_USERNAME = os.getenv("AT_USERNAME")      # should be "sandbox"
+AT_API_KEY = os.getenv("AT_API_KEY")
+
+africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
+sms_service = africastalking.SMS  # Global SMS service instance
 
 # ---------- ROOT ROUTE FOR HEALTH CHECK ----------
 @app.get("/")
@@ -50,11 +58,11 @@ def startup():
     init_db()
 
 # ---------- HELPERS ----------
-ALLOWED_FIELDS = {"level","math","science","social","creative","technical","pathway","state"}
+ALLOWED_FIELDS = {"level", "math", "science", "social", "creative", "technical", "pathway", "state"}
 
 def save_student(phone, field, value):
     if field not in ALLOWED_FIELDS:
-        raise ValueError("Invalid field")
+        raise ValueError(f"Invalid field: {field}")
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("INSERT INTO students(phone) VALUES(%s) ON CONFLICT DO NOTHING", (phone,))
@@ -74,6 +82,9 @@ def get_student(phone):
 
 def calculate_pathway(phone):
     student = get_student(phone)
+    if not student:
+        return None
+    # phone, level, math, science, social, creative, technical, pathway, state
     _, _, math, science, social, creative, technical, _, _ = student
 
     stem = (math or 0) + (science or 0) + (technical or 0)
@@ -90,86 +101,139 @@ def calculate_pathway(phone):
     save_student(phone, "pathway", pathway)
     return pathway
 
+# ---------- Outbound SMS Helper ----------
+async def send_reply(to_phone: str, message: str):
+    try:
+        # In sandbox: use from_="XXXXX" (default sandbox sender)
+        # In live: use your shortcode or alphanumeric sender ID
+        response = sms_service.send(
+            message=message,
+            recipients=[to_phone],          # must be a list
+            from_="XXXXX"                   # ← change if you have a custom sender in sandbox
+        )
+        print(f"Reply sent to {to_phone}: {message}")
+        print("AT response:", response)
+    except Exception as e:
+        print(f"Failed to send reply to {to_phone}: {str(e)}")
+
 # ---------- SMS WEBHOOK ----------
 RATING_MAP = {"1": 3, "2": 2, "3": 1}
 
 @app.post("/sms", response_class=PlainTextResponse)
 async def receive_sms(
-    from_: str = Form(..., alias="from"),  # Africa's Talking sends 'from'
+    from_: str = Form(..., alias="from"),
     text: str = Form(...)
 ):
     phone = from_
-    text = text.strip()
-    print(f"Incoming SMS from {phone}: {text}")
+    text_clean = text.strip()
+    text_upper = text_clean.upper()
+    print(f"Incoming SMS from {phone}: {text_clean} (upper: {text_upper})")
 
     student = get_student(phone)
-    if not student:
+
+    # Handle START / first contact / reset
+    if text_upper == "START" or not student:
         save_student(phone, "state", "LEVEL")
-        return "Welcome to Edutena CBE.\nSelect Level:\n1. JSS\n2. Senior"
+        await send_reply(phone, "Welcome to Edutena CBE.\nSelect Level:\n1. JSS\n2. Senior")
+        return ""
 
-    state = student[-1]
-    pathway = student[-2]
+    if not student:
+        await send_reply(phone, "Reply START to begin.")
+        return ""
 
-    # Global CAREERS check
-    if text.upper() == "CAREERS":
+    # Get current state & pathway
+    state = student[-1]   # last column = state
+    pathway = student[-2] # second last = pathway
+
+    # Global CAREERS command (anytime)
+    if text_upper == "CAREERS":
         if not pathway:
             pathway = calculate_pathway(phone)
         if pathway == "STEM":
-            return "1. Engineering\n2. Data Science\n3. Medicine"
-        if pathway == "Social Sciences":
-            return "1. Law\n2. Psychology\n3. Economics"
-        if pathway == "Arts & Sports Science":
-            return "1. Design\n2. Music\n3. Sports"
+            await send_reply(phone, "STEM Careers:\n1. Engineering\n2. Data Science\n3. Medicine")
+        elif pathway == "Social Sciences":
+            await send_reply(phone, "Social Sciences Careers:\n1. Law\n2. Psychology\n3. Economics")
+        elif pathway == "Arts & Sports Science":
+            await send_reply(phone, "Arts & Sports Careers:\n1. Design\n2. Music\n3. Sports")
+        else:
+            await send_reply(phone, "No pathway calculated yet. Complete ratings first.")
+        return ""
 
     try:
         if state == "LEVEL":
-            level = "JSS" if text == "1" else "Senior"
+            if text_clean == "1":
+                level = "JSS"
+            elif text_clean == "2":
+                level = "Senior"
+            else:
+                await send_reply(phone, "Invalid choice. Select Level:\n1. JSS\n2. Senior")
+                return ""
             save_student(phone, "level", level)
             save_student(phone, "state", "MATH")
-            return "Rate Math:\n1. Exceeding\n2. Meeting\n3. Approaching"
+            await send_reply(phone, "Rate Math:\n1. Exceeding\n2. Meeting\n3. Approaching")
+            return ""
 
-        if state == "MATH":
-            score = RATING_MAP.get(text)
+        elif state == "MATH":
+            score = RATING_MAP.get(text_clean)
             if not score:
-                return "Invalid input. Rate Math:\n1. Exceeding\n2. Meeting\n3. Approaching"
+                await send_reply(phone, "Invalid input. Rate Math:\n1. Exceeding\n2. Meeting\n3. Approaching")
+                return ""
             save_student(phone, "math", score)
             save_student(phone, "state", "SCIENCE")
-            return "Rate Science:\n1. Exceeding\n2. Meeting\n3. Approaching"
+            await send_reply(phone, "Rate Science:\n1. Exceeding\n2. Meeting\n3. Approaching")
+            return ""
 
-        if state == "SCIENCE":
-            score = RATING_MAP.get(text)
+        elif state == "SCIENCE":
+            score = RATING_MAP.get(text_clean)
             if not score:
-                return "Invalid input. Rate Science:\n1. Exceeding\n2. Meeting\n3. Approaching"
+                await send_reply(phone, "Invalid input. Rate Science:\n1. Exceeding\n2. Meeting\n3. Approaching")
+                return ""
             save_student(phone, "science", score)
             save_student(phone, "state", "SOCIAL")
-            return "Rate Social Studies:\n1. Exceeding\n2. Meeting\n3. Approaching"
+            await send_reply(phone, "Rate Social Studies:\n1. Exceeding\n2. Meeting\n3. Approaching")
+            return ""
 
-        if state == "SOCIAL":
-            score = RATING_MAP.get(text)
+        elif state == "SOCIAL":
+            score = RATING_MAP.get(text_clean)
             if not score:
-                return "Invalid input. Rate Social Studies:\n1. Exceeding\n2. Meeting\n3. Approaching"
+                await send_reply(phone, "Invalid input. Rate Social Studies:\n1. Exceeding\n2. Meeting\n3. Approaching")
+                return ""
             save_student(phone, "social", score)
             save_student(phone, "state", "CREATIVE")
-            return "Rate Creative Arts:\n1. Exceeding\n2. Meeting\n3. Approaching"
+            await send_reply(phone, "Rate Creative Arts:\n1. Exceeding\n2. Meeting\n3. Approaching")
+            return ""
 
-        if state == "CREATIVE":
-            score = RATING_MAP.get(text)
+        elif state == "CREATIVE":
+            score = RATING_MAP.get(text_clean)
             if not score:
-                return "Invalid input. Rate Creative Arts:\n1. Exceeding\n2. Meeting\n3. Approaching"
+                await send_reply(phone, "Invalid input. Rate Creative Arts:\n1. Exceeding\n2. Meeting\n3. Approaching")
+                return ""
             save_student(phone, "creative", score)
             save_student(phone, "state", "TECH")
-            return "Rate Technical Skills:\n1. Exceeding\n2. Meeting\n3. Approaching"
+            await send_reply(phone, "Rate Technical Skills:\n1. Exceeding\n2. Meeting\n3. Approaching")
+            return ""
 
-        if state == "TECH":
-            score = RATING_MAP.get(text)
+        elif state == "TECH":
+            score = RATING_MAP.get(text_clean)
             if not score:
-                return "Invalid input. Rate Technical Skills:\n1. Exceeding\n2. Meeting\n3. Approaching"
+                await send_reply(phone, "Invalid input. Rate Technical Skills:\n1. Exceeding\n2. Meeting\n3. Approaching")
+                return ""
             save_student(phone, "technical", score)
             save_student(phone, "state", "DONE")
             pathway = calculate_pathway(phone)
-            return f"Recommended Pathway:\n{pathway}\nReply CAREERS to see careers"
+            await send_reply(phone, f"Recommended Pathway:\n{pathway}\nReply CAREERS to see careers")
+            return ""
 
-        return "Reply START to begin."
+        else:
+            # Unknown / DONE state
+            await send_reply(phone, "You've completed the assessment.\nReply CAREERS for career suggestions or START to reset.")
+            return ""
+
     except Exception as e:
-        print("Error processing SMS:", e)
-        return "Sorry, something went wrong. Please try again."
+        print("Error processing SMS:", str(e))
+        await send_reply(phone, "Sorry, something went wrong. Please try again or reply START.")
+        return ""
+
+    # Fallback (should not reach here)
+    await send_reply(phone, "Reply START to begin.")
+    return ""
