@@ -7,12 +7,12 @@ import africastalking
 
 app = FastAPI()
 
-# ---------- Initialize Africa's Talking SDK (once at startup) ----------
+# ---------- Initialize Africa's Talking SDK ----------
 AT_USERNAME = os.getenv("AT_USERNAME")      # should be "sandbox"
 AT_API_KEY = os.getenv("AT_API_KEY")
 
 africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
-sms_service = africastalking.SMS  # Global SMS service instance
+sms_service = africastalking.SMS
 
 # ---------- ROOT ROUTE FOR HEALTH CHECK ----------
 @app.get("/")
@@ -101,18 +101,17 @@ def calculate_pathway(phone):
     save_student(phone, "pathway", pathway)
     return pathway
 
-# ---------- Outbound SMS Helper ----------
+# ---------- Outbound SMS Helper (FIXED - no from_ parameter) ----------
 async def send_reply(to_phone: str, message: str):
     try:
-        # In sandbox: use from_="XXXXX" (default sandbox sender)
-        # In live: use your shortcode or alphanumeric sender ID
         response = sms_service.send(
             message=message,
-            recipients=[to_phone],          # must be a list
-            from_="XXXXX"                   # ← change if you have a custom sender in sandbox
+            recipients=[to_phone]
+            # If you later get a shortcode in sandbox or go live, add:
+            # sender_id="YOUR_SHORTCODE_HERE"
         )
         print(f"Reply sent to {to_phone}: {message}")
-        print("AT response:", response)
+        print("Full Africa's Talking response:", response)
     except Exception as e:
         print(f"Failed to send reply to {to_phone}: {str(e)}")
 
@@ -234,6 +233,6 @@ async def receive_sms(
         await send_reply(phone, "Sorry, something went wrong. Please try again or reply START.")
         return ""
 
-    # Fallback (should not reach here)
+    # Fallback
     await send_reply(phone, "Reply START to begin.")
     return ""
