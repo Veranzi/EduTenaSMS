@@ -101,14 +101,13 @@ def calculate_pathway(phone):
     save_student(phone, "pathway", pathway)
     return pathway
 
-# ---------- Outbound SMS Helper (FIXED - no from_ parameter) ----------
+# ---------- Outbound SMS Helper ----------
 async def send_reply(to_phone: str, message: str):
     try:
         response = sms_service.send(
             message=message,
-            recipients=[to_phone]
-            # If you later get a shortcode in sandbox or go live, add:
-            sender_id="98449"
+            recipients=[to_phone],
+            sender_id="98449"   # ← Required so replies appear in the simulator thread
         )
         print(f"Reply sent to {to_phone}: {message}")
         print("Full Africa's Talking response:", response)
