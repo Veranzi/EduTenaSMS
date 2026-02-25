@@ -3,24 +3,17 @@ from fastapi.responses import PlainTextResponse
 import psycopg2
 from urllib.parse import urlparse
 import os
-import hashlib
 import africastalking
-from groq import Groq
 
 app = FastAPI()
 
 # ---------- Initialize Africa's Talking SDK ----------
-AT_USERNAME = os.getenv("AT_USERNAME")   # "sandbox" or your live username
+AT_USERNAME = os.getenv("AT_USERNAME")
 AT_API_KEY  = os.getenv("AT_API_KEY")
 
 africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
 sms_service = africastalking.SMS
 
-# ---------- Initialize Groq Client ----------
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-groq_client  = Groq(api_key=GROQ_API_KEY)
-
-# Shortcode — change to your live shortcode when going live
 SENDER_ID = os.getenv("AT_SENDER_ID", "98449")
 
 # ---------- ROOT ROUTE FOR HEALTH CHECK ----------
@@ -44,20 +37,24 @@ def get_connection():
 def init_db():
     conn = get_connection()
     cur  = conn.cursor()
+    # Create table if not exists (fresh installs)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS students (
-            phone_hash  TEXT PRIMARY KEY,
-            level       TEXT,
-            math        INTEGER,
-            science     INTEGER,
-            social      INTEGER,
-            creative    INTEGER,
-            technical   INTEGER,
-            pathway     TEXT,
-            risk        TEXT,
-            state       TEXT,
-            lang        TEXT DEFAULT 'en'
+            phone      TEXT PRIMARY KEY,
+            level      TEXT,
+            math       INTEGER,
+            science    INTEGER,
+            social     INTEGER,
+            creative   INTEGER,
+            technical  INTEGER,
+            pathway    TEXT,
+            state      TEXT,
+            lang       TEXT DEFAULT 'en'
         )
+    """)
+    # Safe migration: add lang column if upgrading from old schema
+    cur.execute("""
+        ALTER TABLE students ADD COLUMN IF NOT EXISTS lang TEXT DEFAULT 'en'
     """)
     conn.commit()
     cur.close()
@@ -67,154 +64,53 @@ def init_db():
 def startup():
     init_db()
 
-# ---------- PRIVACY: Hash phone number ----------
-def hash_phone(phone: str) -> str:
-    """SHA-256 hash — raw phone number is never stored in the database."""
-    return hashlib.sha256(phone.strip().encode()).hexdigest()
-
-# ---------- DB HELPERS ----------
+# ---------- HELPERS ----------
 ALLOWED_FIELDS = {
     "level", "math", "science", "social", "creative",
-    "technical", "pathway", "risk", "state", "lang"
+    "technical", "pathway", "state", "lang"
 }
 
-def save_student(phone_hash: str, field: str, value):
+def save_student(phone, field, value):
     if field not in ALLOWED_FIELDS:
         raise ValueError(f"Invalid field: {field}")
     conn = get_connection()
     cur  = conn.cursor()
-    cur.execute(
-        "INSERT INTO students(phone_hash) VALUES(%s) ON CONFLICT DO NOTHING",
-        (phone_hash,)
-    )
-    cur.execute(
-        f"UPDATE students SET {field}=%s WHERE phone_hash=%s",
-        (value, phone_hash)
-    )
+    cur.execute("INSERT INTO students(phone) VALUES(%s) ON CONFLICT DO NOTHING", (phone,))
+    cur.execute(f"UPDATE students SET {field}=%s WHERE phone=%s", (value, phone))
     conn.commit()
     cur.close()
     conn.close()
 
-def get_student(phone_hash: str):
+def get_student(phone):
     conn = get_connection()
     cur  = conn.cursor()
-    cur.execute("SELECT * FROM students WHERE phone_hash=%s", (phone_hash,))
+    cur.execute("SELECT * FROM students WHERE phone=%s", (phone,))
     student = cur.fetchone()
     cur.close()
     conn.close()
     return student
-    # columns index:
-    # 0:phone_hash 1:level 2:math 3:science 4:social
-    # 5:creative 6:technical 7:pathway 8:risk 9:state 10:lang
+    # columns: phone(0), level(1), math(2), science(3), social(4),
+    #          creative(5), technical(6), pathway(7), state(8), lang(9)
 
-# ---------- PATHWAY CALCULATION ----------
-def calculate_pathway(phone_hash: str) -> str:
-    student = get_student(phone_hash)
+def calculate_pathway(phone):
+    student = get_student(phone)
     if not student:
         return None
-    _, _, math, science, social, creative, technical, _, _, _, _ = student
+    _, _, math, science, social, creative, technical, _, _, _ = student
 
     stem         = (math or 0) + (science or 0) + (technical or 0)
     social_score = (social or 0) * 2
-    arts_score   = (creative or 0) * 2
+    arts         = (creative or 0) * 2
 
-    if stem >= social_score and stem >= arts_score:
+    if stem >= social_score and stem >= arts:
         pathway = "STEM"
-    elif social_score >= stem and social_score >= arts_score:
+    elif social_score >= stem and social_score >= arts:
         pathway = "Social Sciences"
     else:
         pathway = "Arts & Sports Science"
 
-    save_student(phone_hash, "pathway", pathway)
+    save_student(phone, "pathway", pathway)
     return pathway
-
-# ---------- RISK CALCULATION ----------
-def calculate_risk(phone_hash: str) -> str:
-    student = get_student(phone_hash)
-    if not student:
-        return "Unknown"
-    _, _, math, science, social, creative, technical, _, _, _, _ = student
-
-    scores = [math or 0, science or 0, social or 0, creative or 0, technical or 0]
-    avg    = sum(scores) / len(scores)
-
-    if avg >= 2.5:
-        risk = "Low"
-    elif avg >= 1.5:
-        risk = "Medium"
-    else:
-        risk = "High"
-
-    save_student(phone_hash, "risk", risk)
-    return risk
-
-# ---------- SMS FORMATTER ----------
-def sms_format(text: str, limit: int = 459) -> str:
-    """Trim AI response to fit within 3 SMS parts (459 chars max)."""
-    text = text.strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit - 3] + "..."
-
-# ---------- GROQ AI FUNCTIONS ----------
-
-def ai_career_guidance(pathway: str, level: str, lang: str = "en") -> str:
-    lang_note = "Respond in Kiswahili." if lang == "sw" else "Respond in English."
-    prompt = (
-        f"A Kenyan {level} student is placed in the {pathway} pathway under CBC. "
-        f"Suggest 3 specific career options with a one-line description each. "
-        f"Be encouraging, practical, and relevant to Kenya's job market. "
-        f"Keep total response under 400 characters. {lang_note}"
-    )
-    try:
-        res = groq_client.chat.completions.create(
-            model="mistral-saba-24b",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
-            temperature=0.7
-        )
-        return sms_format(res.choices[0].message.content)
-    except Exception as e:
-        print(f"Groq career error: {e}")
-        return "Career guidance unavailable. Please try again later."
-
-def ai_cbe_summary(topic: str, level: str, lang: str = "en") -> str:
-    lang_note = "Respond in Kiswahili." if lang == "sw" else "Respond in English."
-    prompt = (
-        f"Summarize the CBC Kenya topic '{topic}' for a {level} student. "
-        f"Provide 3 key learning points only. "
-        f"Keep total response under 400 characters. {lang_note}"
-    )
-    try:
-        res = groq_client.chat.completions.create(
-            model="mistral-saba-24b",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
-            temperature=0.5
-        )
-        return sms_format(res.choices[0].message.content)
-    except Exception as e:
-        print(f"Groq CBE error: {e}")
-        return "Summary unavailable. Please try again later."
-
-def ai_risk_advice(risk: str, pathway: str, lang: str = "en") -> str:
-    lang_note = "Respond in Kiswahili." if lang == "sw" else "Respond in English."
-    prompt = (
-        f"A Kenyan student has a {risk} transition risk for the {pathway} pathway under CBC. "
-        f"Give 2 short, practical improvement tips. "
-        f"Be direct, supportive, and specific. Under 350 characters. {lang_note}"
-    )
-    try:
-        res = groq_client.chat.completions.create(
-            model="mistral-saba-24b",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
-            temperature=0.6
-        )
-        return sms_format(res.choices[0].message.content)
-    except Exception as e:
-        print(f"Groq risk error: {e}")
-        return "Risk advice unavailable. Please try again later."
 
 # ---------- OUTBOUND SMS ----------
 async def send_reply(to_phone: str, message: str):
@@ -224,46 +120,91 @@ async def send_reply(to_phone: str, message: str):
             recipients=[to_phone],
             sender_id=SENDER_ID
         )
-        print(f"Sent to {to_phone[:7]}****: {message[:80]}")
+        print(f"Reply to {to_phone[:7]}****: {message[:80]}")
         print("AT:", response)
     except Exception as e:
-        print(f"SMS send failed: {e}")
+        print(f"SMS failed: {str(e)}")
 
-# ---------- LANGUAGE DETECTION ----------
-def detect_lang(text: str) -> str:
-    sw_keywords = ["habari", "ndiyo", "hapana", "asante", "tafadhali", "sawa"]
-    if any(kw in text.lower() for kw in sw_keywords):
-        return "sw"
-    return "en"
+# ---------- LANGUAGE MENUS ----------
+# Supported languages: en, sw, lh (Luhya), ki (Kikuyu)
 
-# ---------- MENU STRINGS ----------
 MENU = {
     "en": {
-        "welcome":     "Welcome to EduTena CBE.\nSelect Level:\n1. JSS\n2. Senior\n\nTip: Reply SW for Kiswahili",
-        "level_err":   "Invalid. Select:\n1. JSS\n2. Senior",
-        "math":        "Rate Math:\n1. Exceeding\n2. Meeting\n3. Approaching",
-        "science":     "Rate Science:\n1. Exceeding\n2. Meeting\n3. Approaching",
-        "social":      "Rate Social Studies:\n1. Exceeding\n2. Meeting\n3. Approaching",
-        "creative":    "Rate Creative Arts:\n1. Exceeding\n2. Meeting\n3. Approaching",
-        "tech":        "Rate Technical Skills:\n1. Exceeding\n2. Meeting\n3. Approaching",
-        "invalid":     "Invalid. Reply 1, 2, or 3.",
-        "done":        "Commands:\nCAREERS - AI career guide\nLEARN [topic] - CBE summary\nRISK - transition risk\nSTART - restart",
-        "no_pathway":  "Complete assessment first. Reply START.",
-        "learn_usage": "Usage: LEARN [topic]\nExample: LEARN photosynthesis",
+        "lang_confirm":  "Language: English ✅\nReply START to begin.",
+        "welcome":       "Welcome to EduTena CBE.\nSelect Level:\n1. JSS\n2. Senior\n\nChange language:\nSW=Swahili LH=Luhya KI=Kikuyu",
+        "level_err":     "Invalid. Select:\n1. JSS\n2. Senior",
+        "math":          "Rate Math:\n1. Exceeding\n2. Meeting\n3. Approaching",
+        "science":       "Rate Science:\n1. Exceeding\n2. Meeting\n3. Approaching",
+        "social":        "Rate Social Studies:\n1. Exceeding\n2. Meeting\n3. Approaching",
+        "creative":      "Rate Creative Arts:\n1. Exceeding\n2. Meeting\n3. Approaching",
+        "tech":          "Rate Technical Skills:\n1. Exceeding\n2. Meeting\n3. Approaching",
+        "invalid":       "Invalid. Reply 1, 2, or 3.",
+        "pathway_msg":   "Recommended Pathway:\n{pathway}\nReply CAREERS to see careers.",
+        "careers_stem":  "STEM Careers:\n1. Engineering\n2. Data Science\n3. Medicine",
+        "careers_soc":   "Social Sciences Careers:\n1. Law\n2. Psychology\n3. Economics",
+        "careers_arts":  "Arts & Sports Careers:\n1. Design\n2. Music\n3. Sports",
+        "no_pathway":    "Complete assessment first. Reply START.",
+        "done":          "Assessment complete.\nReply CAREERS for options or START to restart.",
     },
     "sw": {
-        "welcome":     "Karibu EduTena CBE.\nChagua Kiwango:\n1. JSS\n2. Sekondari\n\nKidokezo: Jibu EN kwa Kiingereza",
-        "level_err":   "Batili. Chagua:\n1. JSS\n2. Sekondari",
-        "math":        "Kadiria Hisabati:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia",
-        "science":     "Kadiria Sayansi:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia",
-        "social":      "Kadiria Sayansi Jamii:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia",
-        "creative":    "Kadiria Sanaa:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia",
-        "tech":        "Kadiria Ujuzi wa Kiufundi:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia",
-        "invalid":     "Batili. Jibu 1, 2, au 3.",
-        "done":        "Amri:\nCAREERS - mwongozo wa kazi\nLEARN [mada] - muhtasari CBE\nRISK - hatari ya mpito\nSTART - anza upya",
-        "no_pathway":  "Maliza tathmini kwanza. Jibu START.",
-        "learn_usage": "Matumizi: LEARN [mada]\nMfano: LEARN usanisinuru",
-    }
+        "lang_confirm":  "Lugha: Kiswahili ✅\nJibu START kuanza.",
+        "welcome":       "Karibu EduTena CBE.\nChagua Kiwango:\n1. JSS\n2. Sekondari\n\nBadilisha lugha:\nEN=Kiingereza LH=Luhya KI=Kikuyu",
+        "level_err":     "Batili. Chagua:\n1. JSS\n2. Sekondari",
+        "math":          "Kadiria Hisabati:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia",
+        "science":       "Kadiria Sayansi:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia",
+        "social":        "Kadiria Sayansi Jamii:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia",
+        "creative":      "Kadiria Sanaa:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia",
+        "tech":          "Kadiria Ujuzi wa Kiufundi:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia",
+        "invalid":       "Batili. Jibu 1, 2, au 3.",
+        "pathway_msg":   "Njia Inayopendekezwa:\n{pathway}\nJibu CAREERS kuona kazi.",
+        "careers_stem":  "Kazi za STEM:\n1. Uhandisi\n2. Sayansi ya Data\n3. Dawa",
+        "careers_soc":   "Kazi za Sayansi Jamii:\n1. Sheria\n2. Saikolojia\n3. Uchumi",
+        "careers_arts":  "Kazi za Sanaa & Michezo:\n1. Usanifu\n2. Muziki\n3. Michezo",
+        "no_pathway":    "Maliza tathmini kwanza. Jibu START.",
+        "done":          "Tathmini imekamilika.\nJibu CAREERS kwa kazi au START kuanza upya.",
+    },
+    "lh": {
+        "lang_confirm":  "Olulimi: Luhya ✅\nJibu START okhuandaa.",
+        "welcome":       "Wafwelwa e EduTena CBE.\nSena Engufu:\n1. JSS\n2. Sekondari\n\nSena olulimi:\nEN=Kingereza SW=Kiswahili KI=Kikuyu",
+        "level_err":     "Busia. Sena:\n1. JSS\n2. Sekondari",
+        "math":          "Kadiria Hesabu:\n1. Okhupiha\n2. Okhufika\n3. Okhuneela",
+        "science":       "Kadiria Sayansi:\n1. Okhupiha\n2. Okhufika\n3. Okhuneela",
+        "social":        "Kadiria Elimu ya Jamii:\n1. Okhupiha\n2. Okhufika\n3. Okhuneela",
+        "creative":      "Kadiria Sanaa:\n1. Okhupiha\n2. Okhufika\n3. Okhuneela",
+        "tech":          "Kadiria Ujuzi wa Kiufundi:\n1. Okhupiha\n2. Okhufika\n3. Okhuneela",
+        "invalid":       "Busia. Jibu 1, 2, kamba 3.",
+        "pathway_msg":   "Njia Enyiseniwe:\n{pathway}\nJibu CAREERS okhuona emilimo.",
+        "careers_stem":  "Emilimo ya STEM:\n1. Uhandisi\n2. Sayansi ya Data\n3. Dawa",
+        "careers_soc":   "Emilimo ya Jamii:\n1. Sheria\n2. Saikolojia\n3. Uchumi",
+        "careers_arts":  "Emilimo ya Sanaa:\n1. Usanifu\n2. Muziki\n3. Michezo",
+        "no_pathway":    "Maliza tathmini kwanza. Jibu START.",
+        "done":          "Tathmini yakhwira.\nJibu CAREERS kwa emilimo kamba START okhuanza.",
+    },
+    "ki": {
+        "lang_confirm":  "Rurimi: Kikuyu ✅\nCookia START guthomia.",
+        "welcome":       "Ndumiria EduTena CBE.\nThura Kiwango:\n1. JSS\n2. Sekondari\n\nThura rurimi:\nEN=Kingereza SW=Kiswahili LH=Luhya",
+        "level_err":     "Ti wegwaru. Thura:\n1. JSS\n2. Sekondari",
+        "math":          "Kadiria Hesabu:\n1. Gucokia\n2. Gufika\n3. Guserekania",
+        "science":       "Kadiria Sayansi:\n1. Gucokia\n2. Gufika\n3. Guserekania",
+        "social":        "Kadiria Maarifa ya Jamii:\n1. Gucokia\n2. Gufika\n3. Guserekania",
+        "creative":      "Kadiria Sanaa:\n1. Gucokia\n2. Gufika\n3. Guserekania",
+        "tech":          "Kadiria Ujuzi wa Kiufundi:\n1. Gucokia\n2. Gufika\n3. Guserekania",
+        "invalid":       "Ti wegwaru. Cookia 1, 2, kana 3.",
+        "pathway_msg":   "Njia Yoneneirwo:\n{pathway}\nCookia CAREERS kuona mirimo.",
+        "careers_stem":  "Mirimo ya STEM:\n1. Uhandisi\n2. Sayansi ya Data\n3. Dawa",
+        "careers_soc":   "Mirimo ya Jamii:\n1. Sheria\n2. Saikolojia\n3. Uchumi",
+        "careers_arts":  "Mirimo ya Sanaa:\n1. Usanifu\n2. Muziki\n3. Michezo",
+        "no_pathway":    "Ithoma mbere. Cookia START.",
+        "done":          "Ithomo niikuura.\nCookia CAREERS mirimo kana START gutomia.",
+    },
+}
+
+# Commands to switch language (work anytime, even mid-assessment)
+LANG_TRIGGERS = {
+    "EN": "en",
+    "SW": "sw",
+    "LH": "lh",
+    "KI": "ki",
 }
 
 RATING_MAP = {"1": 3, "2": 2, "3": 1}
@@ -275,78 +216,53 @@ async def receive_sms(
     text:  str = Form(...)
 ):
     phone      = from_
-    phone_hash = hash_phone(phone)  # privacy: raw phone never stored
     text_clean = text.strip()
     text_upper = text_clean.upper()
     print(f"Incoming from {phone[:7]}****: {text_clean}")
 
-    student = get_student(phone_hash)
+    student = get_student(phone)
 
-    # ── Language switch ──────────────────────────────────────────
-    if text_upper == "SW":
-        save_student(phone_hash, "lang", "sw")
-        await send_reply(phone, "Lugha: Kiswahili ✅\nJibu START kuanza.")
-        return ""
-    if text_upper == "EN":
-        save_student(phone_hash, "lang", "en")
-        await send_reply(phone, "Language: English ✅\nReply START to begin.")
+    # ── Language switch (works anytime, even mid-assessment) ─────
+    if text_upper in LANG_TRIGGERS:
+        new_lang = LANG_TRIGGERS[text_upper]
+        save_student(phone, "lang", new_lang)
+        await send_reply(phone, MENU[new_lang]["lang_confirm"])
         return ""
 
-    # Determine language
+    # Determine current language (default English)
     lang = "en"
-    if student and student[10]:
-        lang = student[10]
-    else:
-        lang = detect_lang(text_clean)
+    if student and len(student) >= 10 and student[9]:
+        lang = student[9]
     M = MENU[lang]
 
     # ── START / first contact / reset ────────────────────────────
     if text_upper == "START" or not student:
-        save_student(phone_hash, "state", "LEVEL")
-        save_student(phone_hash, "lang", lang)
+        save_student(phone, "state", "LEVEL")
+        save_student(phone, "lang", lang)
+        await send_reply(phone, M["welcome"])
+        return ""
+
+    if not student:
         await send_reply(phone, M["welcome"])
         return ""
 
     # ── Read current state ───────────────────────────────────────
-    state   = student[9]
+    state   = student[8]
     pathway = student[7]
-    level   = student[1] or "JSS"
 
-    # ── Global commands ──────────────────────────────────────────
-
-    # CAREERS — AI career guidance
+    # ── CAREERS command ──────────────────────────────────────────
     if text_upper == "CAREERS":
         if not pathway:
-            pathway = calculate_pathway(phone_hash)
+            pathway = calculate_pathway(phone)
         if not pathway:
             await send_reply(phone, M["no_pathway"])
             return ""
-        reply = ai_career_guidance(pathway, level, lang)
-        await send_reply(phone, reply)
-        return ""
-
-    # LEARN [topic] — AI CBE summarizer
-    if text_upper.startswith("LEARN"):
-        parts = text_clean.split(None, 1)
-        if len(parts) < 2:
-            await send_reply(phone, M["learn_usage"])
-            return ""
-        topic = parts[1]
-        reply = ai_cbe_summary(topic, level, lang)
-        await send_reply(phone, reply)
-        return ""
-
-    # RISK — AI transition risk assessment
-    if text_upper == "RISK":
-        if not pathway:
-            pathway = calculate_pathway(phone_hash)
-        if not pathway:
-            await send_reply(phone, M["no_pathway"])
-            return ""
-        risk        = calculate_risk(phone_hash)
-        advice      = ai_risk_advice(risk, pathway, lang)
-        risk_label  = {"Low": "✅ Low", "Medium": "⚠️ Medium", "High": "🔴 High"}.get(risk, risk)
-        await send_reply(phone, f"Transition Risk: {risk_label}\n\n{advice}")
+        if pathway == "STEM":
+            await send_reply(phone, M["careers_stem"])
+        elif pathway == "Social Sciences":
+            await send_reply(phone, M["careers_soc"])
+        else:
+            await send_reply(phone, M["careers_arts"])
         return ""
 
     # ── Assessment state machine ─────────────────────────────────
@@ -359,8 +275,8 @@ async def receive_sms(
             else:
                 await send_reply(phone, M["level_err"])
                 return ""
-            save_student(phone_hash, "level", lvl)
-            save_student(phone_hash, "state", "MATH")
+            save_student(phone, "level", lvl)
+            save_student(phone, "state", "MATH")
             await send_reply(phone, M["math"])
             return ""
 
@@ -369,8 +285,8 @@ async def receive_sms(
             if not score:
                 await send_reply(phone, f"{M['invalid']}\n{M['math']}")
                 return ""
-            save_student(phone_hash, "math", score)
-            save_student(phone_hash, "state", "SCIENCE")
+            save_student(phone, "math", score)
+            save_student(phone, "state", "SCIENCE")
             await send_reply(phone, M["science"])
             return ""
 
@@ -379,8 +295,8 @@ async def receive_sms(
             if not score:
                 await send_reply(phone, f"{M['invalid']}\n{M['science']}")
                 return ""
-            save_student(phone_hash, "science", score)
-            save_student(phone_hash, "state", "SOCIAL")
+            save_student(phone, "science", score)
+            save_student(phone, "state", "SOCIAL")
             await send_reply(phone, M["social"])
             return ""
 
@@ -389,8 +305,8 @@ async def receive_sms(
             if not score:
                 await send_reply(phone, f"{M['invalid']}\n{M['social']}")
                 return ""
-            save_student(phone_hash, "social", score)
-            save_student(phone_hash, "state", "CREATIVE")
+            save_student(phone, "social", score)
+            save_student(phone, "state", "CREATIVE")
             await send_reply(phone, M["creative"])
             return ""
 
@@ -399,8 +315,8 @@ async def receive_sms(
             if not score:
                 await send_reply(phone, f"{M['invalid']}\n{M['creative']}")
                 return ""
-            save_student(phone_hash, "creative", score)
-            save_student(phone_hash, "state", "TECH")
+            save_student(phone, "creative", score)
+            save_student(phone, "state", "TECH")
             await send_reply(phone, M["tech"])
             return ""
 
@@ -409,39 +325,21 @@ async def receive_sms(
             if not score:
                 await send_reply(phone, f"{M['invalid']}\n{M['tech']}")
                 return ""
-            save_student(phone_hash, "technical", score)
-
-            # Calculate pathway + risk
-            pathway    = calculate_pathway(phone_hash)
-            risk       = calculate_risk(phone_hash)
-            save_student(phone_hash, "state", "DONE")
-
-            risk_label = {"Low": "✅ Low", "Medium": "⚠️ Medium", "High": "🔴 High"}.get(risk, risk)
-
-            if lang == "sw":
-                result = (
-                    f"Njia: {pathway}\n"
-                    f"Hatari ya Mpito: {risk_label}\n\n"
-                    f"{M['done']}"
-                )
-            else:
-                result = (
-                    f"Pathway: {pathway}\n"
-                    f"Transition Risk: {risk_label}\n\n"
-                    f"{M['done']}"
-                )
-            await send_reply(phone, result)
+            save_student(phone, "technical", score)
+            save_student(phone, "state", "DONE")
+            pathway = calculate_pathway(phone)
+            await send_reply(phone, M["pathway_msg"].format(pathway=pathway))
             return ""
 
         else:
-            # DONE state — show command menu
+            # DONE state — remind of available commands
             await send_reply(phone, M["done"])
             return ""
 
     except Exception as e:
-        print(f"Error: {e}")
-        await send_reply(phone, "Something went wrong. Reply START to try again.")
+        print("Error:", str(e))
+        await send_reply(phone, "Error. Reply START to try again.")
         return ""
 
-    await send_reply(phone, "Reply START to begin.")
+    await send_reply(phone, M["welcome"])
     return ""
