@@ -108,7 +108,7 @@ async def send_reply(to_phone: str, message: str):
             message=message,
             recipients=[to_phone]
             # If you later get a shortcode in sandbox or go live, add:
-            # sender_id="YOUR_SHORTCODE_HERE"
+            sender_id="98449"
         )
         print(f"Reply sent to {to_phone}: {message}")
         print("Full Africa's Talking response:", response)
