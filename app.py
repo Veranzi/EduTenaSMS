@@ -1,4 +1,4 @@
-ffrom fastapi import FastAPI, Form
+from fastapi import FastAPI, Form
 from fastapi.responses import PlainTextResponse
 import psycopg2
 from urllib.parse import urlparse
