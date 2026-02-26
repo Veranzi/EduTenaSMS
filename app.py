@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Form
+ffrom fastapi import FastAPI, Form
 from fastapi.responses import PlainTextResponse
 import psycopg2
 from urllib.parse import urlparse
@@ -88,7 +88,7 @@ def startup():
 #  SHARED HELPERS
 # =============================================================
 
-# CBC 4-level performance rating
+# CBE 4-level performance rating
 # 4 = Exceeding Expectation
 # 3 = Meeting Expectation
 # 2 = Approaching Expectation
@@ -469,7 +469,7 @@ async def ussd_callback(
         ussd_save(phone, "state", "LEVEL")
         return con(
             "Welcome to EduTena CBE\n"
-            "CBC Pathway Assessment\n"
+            "CBE Pathway Assessment\n"
             "Select Level:\n"
             "1. JSS\n"
             "2. Senior"
