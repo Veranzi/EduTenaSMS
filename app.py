@@ -701,52 +701,74 @@ def get_career_ussd_list(pathway: str) -> str:
 
 
 # =============================================================
-#  GEMINI RAG — CBE KNOWLEDGE BASE
+#  GEMINI — SHARED BASE CONTEXT
 # =============================================================
 
 CBE_KNOWLEDGE = """
 You are EduTena, a Kenya CBE (Competency Based Education) assistant.
-You ONLY answer questions about:
-- Kenya CBC/CBE curriculum structure
-- JSS (Junior Secondary School) Grade 7, 8, 9
-- Senior Secondary School Grade 10, 11, 12
-- CBE pathways: STEM, Social Sciences, Arts & Sports Science
-- The 4 CBE performance levels: Exceeding Expectation (4), Meeting Expectation (3),
-  Approaching Expectation (2), Below Expectation (1)
-- Subject areas per pathway
-- Career guidance aligned to CBC pathways
-- Kenyan universities and colleges for each pathway
-- CBE university entry requirements (NOT 844/points-based system)
-- Kenya labour market and job demand by pathway
-- How parents and students can navigate the CBE system
-- Pathway selection for Grade 10-12
+You help students and parents navigate the CBC/CBE curriculum.
+IMPORTANT: This is CBE — NOT the old 844 system. Entry to university
+is competency portfolio based, not KCSE points.
 
-IMPORTANT: This is CBE — NOT the old 844 system.
-Entry requirements are competency portfolio based, not KCSE points.
+CBE Structure:
+- JSS: Grade 7, 8, 9 (Junior Secondary)
+- Senior Secondary: Grade 10, 11, 12 — pathways: STEM, Social Sciences, Arts & Sports Science
+- Performance levels: Exceeding Expectation (4), Meeting Expectation (3),
+  Approaching Expectation (2), Below Expectation (1)
 
 RULES:
-- Keep answers SHORT — max 3 sentences (SMS, character limit matters)
-- Be warm, encouraging, speak like a Kenyan educator
-- If asked something NOT about CBE/CBC Kenya education, say:
-  "I can only help with CBE/CBC education questions. Reply START to continue."
-- Never give medical, legal, or financial investment advice
-- Always end with an encouraging phrase for the student
+- SMS only — keep ALL responses under 160 characters per sentence
+- Be warm, speak like a trusted Kenyan teacher or older sibling
+- Never give medical, legal or financial investment advice
+- If asked something unrelated to CBE/CBC, say:
+  "I only help with CBE questions. Reply RESUME to continue your assessment."
 """
 
-async def ask_gemini(phone: str, question: str) -> str:
-    if not GEMINI_KEY:
-        return "AI assistant not configured. Reply START to continue your assessment."
+# =============================================================
+#  GEMINI FUNCTION 1 — PERSONALISED CAREER NARRATIVE
+#  Triggered after a Senior student picks a career.
+#  Uses their grade + pathway + career choice to generate
+#  a short, personalised motivational message.
+# =============================================================
 
-    history = get_chat_history(phone, limit=6)
-    history_text = ""
-    for role, msg in history:
-        history_text += f"{role.upper()}: {msg}\n"
+async def gemini_career_narrative(
+    grade: str,
+    pathway: str,
+    career: str,
+    subjects: str,
+    demand: str,
+    lang: str
+) -> str:
+    """
+    Generate a 2-sentence personalised SMS message after career selection.
+    Tells the student WHY this career suits their pathway and what to do next.
+    Falls back to a generic message if Gemini is unavailable.
+    """
+    if not GEMINI_KEY:
+        return f"Great choice! Focus on {subjects} and build a strong CBE portfolio to reach your goal of becoming a {career}. You've got this!"
+
+    lang_instruction = {
+        "sw": "Respond in Kiswahili.",
+        "lh": "Respond in simple Luhya mixed with English.",
+        "ki": "Respond in simple Kikuyu mixed with English.",
+    }.get(lang, "Respond in English.")
 
     prompt = (
         f"{CBE_KNOWLEDGE}\n\n"
-        f"CONVERSATION HISTORY:\n{history_text}\n"
-        f"STUDENT QUESTION: {question}\n\n"
-        f"Answer in max 3 short sentences suitable for SMS:"
+        f"TASK: Write a SHORT personalised motivational message (max 2 sentences, under 300 characters total) "
+        f"for a Kenyan student who just chose their career interest.\n\n"
+        f"Student profile:\n"
+        f"- Grade: {grade}\n"
+        f"- CBE Pathway: {pathway}\n"
+        f"- Career chosen: {career}\n"
+        f"- Key subjects for this career: {subjects}\n"
+        f"- Market demand: {demand} of job postings in Kenya 2025\n\n"
+        f"The message should:\n"
+        f"1. Affirm their choice with a specific reason tied to their pathway\n"
+        f"2. Give ONE concrete next step they can take in school right now\n"
+        f"Do NOT repeat the career name more than once. Be warm and Kenyan.\n"
+        f"{lang_instruction}\n\n"
+        f"Message (2 sentences max):"
     )
 
     try:
@@ -755,10 +777,136 @@ async def ask_gemini(phone: str, question: str) -> str:
                 f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
                 json={
                     "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        "maxOutputTokens": 150,
-                        "temperature": 0.4,
-                    }
+                    "generationConfig": {"maxOutputTokens": 100, "temperature": 0.7},
+                }
+            )
+            data   = response.json()
+            answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            return answer
+    except Exception as e:
+        print(f"[GEMINI career_narrative] Error: {e}")
+        return f"Excellent choice! In {grade}, focus hard on {subjects} — these are your foundation for becoming a {career}. Keep going, the Kenya job market needs you!"
+
+
+# =============================================================
+#  GEMINI FUNCTION 2 — SMART JSS IMPROVEMENT SUGGESTIONS
+#  Replaces the hardcoded rule-based suggestion for Grade 7 & 8.
+#  Generates personalised, encouraging advice based on the
+#  specific combination of scores, not just a list of weak subjects.
+# =============================================================
+
+SCORE_LABEL = {4: "Exceeding Expectation", 3: "Meeting Expectation",
+               2: "Approaching Expectation", 1: "Below Expectation"}
+
+async def gemini_jss_suggestions(
+    grade: str,
+    term: str,
+    math: int,
+    science: int,
+    social: int,
+    creative: int,
+    technical: int,
+    lang: str
+) -> str:
+    """
+    Generate personalised, actionable improvement advice for a JSS student.
+    Falls back to hardcoded logic if Gemini is unavailable.
+    """
+    # Always compute hardcoded fallback first
+    fallback = get_improvement_suggestions(math, science, social, creative, technical, lang)
+
+    if not GEMINI_KEY:
+        return fallback
+
+    lang_instruction = {
+        "sw": "Respond in Kiswahili.",
+        "lh": "Respond in simple Luhya mixed with English.",
+        "ki": "Respond in simple Kikuyu mixed with English.",
+    }.get(lang, "Respond in English.")
+
+    scores_text = (
+        f"Math: {SCORE_LABEL.get(math,'unknown')}\n"
+        f"Science: {SCORE_LABEL.get(science,'unknown')}\n"
+        f"Social Studies: {SCORE_LABEL.get(social,'unknown')}\n"
+        f"Creative Arts: {SCORE_LABEL.get(creative,'unknown')}\n"
+        f"Technical Skills: {SCORE_LABEL.get(technical,'unknown')}"
+    )
+
+    prompt = (
+        f"{CBE_KNOWLEDGE}\n\n"
+        f"TASK: Write a SHORT personalised improvement message (max 3 sentences, under 400 characters total) "
+        f"for a JSS student who just submitted their self-assessment.\n\n"
+        f"Student profile:\n"
+        f"- Grade: {grade}, {term}\n"
+        f"- CBE Performance Levels:\n{scores_text}\n\n"
+        f"The message should:\n"
+        f"1. Acknowledge what they are doing well (their strongest subject)\n"
+        f"2. Name the 1-2 subjects most needing attention and give ONE specific, actionable tip for each\n"
+        f"3. End with a short encouraging phrase\n"
+        f"Be specific, warm, and realistic. Do NOT just list subjects — give real advice.\n"
+        f"{lang_instruction}\n\n"
+        f"Message (3 sentences max):"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"maxOutputTokens": 120, "temperature": 0.6},
+                }
+            )
+            data   = response.json()
+            answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            return answer
+    except Exception as e:
+        print(f"[GEMINI jss_suggestions] Error: {e}")
+        return fallback
+
+
+# =============================================================
+#  GEMINI FUNCTION 3 — MID-FLOW Q&A WITH PAUSE / RESUME
+#  Students can ask a CBE question at ANY point during assessment.
+#  The current state is saved as "PAUSED_<original_state>" so the
+#  flow resumes exactly where it left off when they reply RESUME.
+# =============================================================
+
+async def ask_gemini(phone: str, question: str, context_state: str = "") -> str:
+    """
+    Answer a free-text CBE question via Gemini with conversation memory.
+    Saves the exchange to chat_history for context in follow-up questions.
+    """
+    if not GEMINI_KEY:
+        return "AI assistant not configured. Reply RESUME to continue your assessment."
+
+    history = get_chat_history(phone, limit=6)
+    history_text = ""
+    for role, msg in history:
+        history_text += f"{role.upper()}: {msg}\n"
+
+    # If student is mid-assessment, add context so Gemini can reference it
+    flow_context = ""
+    if context_state:
+        flow_context = f"\nNote: This student is currently in their CBE assessment (step: {context_state}). They can reply RESUME to continue.\n"
+
+    prompt = (
+        f"{CBE_KNOWLEDGE}"
+        f"{flow_context}\n"
+        f"CONVERSATION HISTORY:\n{history_text}\n"
+        f"STUDENT QUESTION: {question}\n\n"
+        f"Answer in max 3 short sentences suitable for SMS. "
+        f"End with: 'Reply RESUME to continue your assessment.' if they are mid-flow, "
+        f"or 'Reply START to begin.' if not."
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"maxOutputTokens": 160, "temperature": 0.4},
                 }
             )
             data   = response.json()
@@ -767,8 +915,8 @@ async def ask_gemini(phone: str, question: str) -> str:
             save_chat(phone, "assistant", answer)
             return answer
     except Exception as e:
-        print(f"[GEMINI] Error: {e}")
-        return "Sorry, I could not answer that right now. Reply START to continue your assessment."
+        print(f"[GEMINI ask] Error: {e}")
+        return "Sorry, I could not answer that right now. Reply RESUME to continue your assessment."
 
 
 def get_chat_history(phone: str, limit: int = 6):
@@ -791,15 +939,78 @@ def save_chat(phone: str, role: str, message: str):
     conn.commit(); cur.close(); conn.close()
 
 
-def is_cbe_question(text: str) -> bool:
-    commands = {"START","CAREERS","MORE","1","2","3","4","5","6","7","8","9","10",
-                "EN","SW","LH","KI","HELP"}
+# ── Mid-flow question detection ───────────────────────────────
+# Commands that are NEVER treated as questions — always menu inputs
+_MENU_COMMANDS = {
+    "START","RESUME","CAREERS","MORE","HELP",
+    "1","2","3","4","5","6","7","8","9","10",
+    "EN","SW","LH","KI",
+}
+
+# States where we must treat input as menu digits, not questions
+_STRICT_MENU_STATES = {
+    "LANG","LEVEL","JSS_GRADE","SENIOR_GRADE","TERM",
+    "SENIOR_PATHWAY","MATH","SCIENCE","SOCIAL","CREATIVE","TECH",
+    "CAREER_SELECT","CAREER_SELECT_ALL",
+}
+
+def is_cbe_question(text: str, state: str = "") -> bool:
+    """
+    Returns True if the text looks like a natural language CBE question.
+    Now works in ANY state except strict menu states — enabling mid-flow Q&A.
+    """
     text_upper = text.strip().upper()
-    if text_upper in commands:
+    if text_upper in _MENU_COMMANDS:
         return False
+    if state in _STRICT_MENU_STATES:
+        return False
+    # Anything longer than 3 chars that isn't a plain digit → treat as question
     if len(text.strip()) > 3 and not text.strip().isdigit():
         return True
     return False
+
+
+def pause_state(phone: str, current_state: str, save_fn):
+    """
+    Save current state as PAUSED_<state> so RESUME can restore it.
+    save_fn is either sms_save or ussd_save.
+    """
+    save_fn(phone, "state", f"PAUSED_{current_state}")
+
+
+def get_paused_state(state: str) -> str | None:
+    """Extract the original state from a PAUSED_<state> string."""
+    if state and state.startswith("PAUSED_"):
+        return state[len("PAUSED_"):]
+    return None
+
+
+# ── Resume message per language ──────────────────────────────
+RESUME_PROMPTS = {
+    "LANG":            {"en": LANG_SELECT_MSG, "sw": LANG_SELECT_MSG, "lh": LANG_SELECT_MSG, "ki": LANG_SELECT_MSG},
+    "LEVEL":           {l: SMS_MENU[l]["welcome"] for l in SMS_MENU},
+    "JSS_GRADE":       {l: SMS_MENU[l]["jss_grade"] for l in SMS_MENU},
+    "SENIOR_GRADE":    {l: SMS_MENU[l]["senior_grade"] for l in SMS_MENU},
+    "TERM":            {l: SMS_MENU[l]["term"] for l in SMS_MENU},
+    "SENIOR_PATHWAY":  {l: SMS_MENU[l]["senior_pathway"] for l in SMS_MENU},
+    "MATH":            {l: f"Rate Math:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
+    "SCIENCE":         {l: f"Rate Science:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
+    "SOCIAL":          {l: f"Rate Social Studies:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
+    "CREATIVE":        {l: f"Rate Creative Arts:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
+    "TECH":            {l: f"Rate Technical Skills:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
+}
+
+def get_resume_prompt(original_state: str, lang: str, student) -> str:
+    """Return the correct re-prompt message for a given state."""
+    mapping = RESUME_PROMPTS.get(original_state)
+    if mapping:
+        return mapping.get(lang, mapping.get("en", "Reply START to begin."))
+    # For CAREER_SELECT we need the pathway
+    if original_state == "CAREER_SELECT":
+        pathway = student[5] or ""
+        grade   = student[3] or ""
+        return get_career_list_sms(pathway, lang, grade)
+    return "Reply START to begin your assessment."
 
 
 # =============================================================
@@ -1015,11 +1226,38 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
     state = student[12]
     M     = SMS_MENU[lang]
 
-    # ── AI Question ───────────────────────────────────────────────
-    if is_cbe_question(text_clean) and state not in (
-        "LANG","LEVEL","JSS_GRADE","SENIOR_GRADE","TERM",
-        "SENIOR_PATHWAY","MATH","SCIENCE","SOCIAL","CREATIVE","TECH"):
-        answer = await ask_gemini(phone, text_clean)
+    # ── GEMINI #3: RESUME — restore paused state ─────────────────
+    # Student asked a mid-flow question → state is PAUSED_<original>
+    # When they reply RESUME, unpause and re-prompt the original step
+    if text_upper == "RESUME":
+        original = get_paused_state(state)
+        if original:
+            sms_save(phone, "state", original)
+            prompt_msg = get_resume_prompt(original, lang, student)
+            await send_reply(phone, prompt_msg)
+        else:
+            await send_reply(phone, M.get("done", "Reply START to begin."))
+        return ""
+
+    # ── GEMINI #3: Mid-flow question detection ───────────────────
+    # If student is PAUSED (already asked a question), keep answering
+    # until they say RESUME. Also detect new questions in non-strict states.
+    paused_original = get_paused_state(state)
+    if paused_original:
+        # They are paused — treat any non-RESUME text as a follow-up question
+        if is_cbe_question(text_clean, state=""):
+            answer = await ask_gemini(phone, text_clean, context_state=paused_original)
+            await send_reply(phone, answer)
+            return ""
+        # If they sent a digit/command while paused, nudge them to RESUME
+        await send_reply(phone, f"Still paused. Reply RESUME to continue your assessment, or ask another CBE question.")
+        return ""
+
+    # Detect a fresh mid-flow question (in non-strict state)
+    if is_cbe_question(text_clean, state=state):
+        # Pause the current state, answer the question
+        pause_state(phone, state, sms_save)
+        answer = await ask_gemini(phone, text_clean, context_state=state)
         await send_reply(phone, answer)
         return ""
 
@@ -1079,7 +1317,6 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
             if not g:
                 await send_reply(phone, M["grade_err"]+"\n"+M["senior_grade"]); return ""
             sms_save(phone, "grade", g)
-            # ↓ Jump directly to pathway — no term for Senior
             sms_save(phone, "state", "SENIOR_PATHWAY")
             await send_reply(phone, M["senior_pathway"])
 
@@ -1150,9 +1387,14 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
                 sms_save(phone, "state", "DONE")
                 await send_reply(phone, M["pathway_msg"].format(pathway=pathway))
             else:
-                suggestions = get_improvement_suggestions(s[6],s[7],s[8],s[9],s[10],lang)
+                # ── GEMINI #2: AI-personalised JSS improvement suggestions ──
+                suggestions = await gemini_jss_suggestions(
+                    grade, term,
+                    s[6], s[7], s[8], s[9], s[10],
+                    lang
+                )
                 sms_save(phone, "state", "DONE")
-                await send_reply(phone, M["tracking_hdr"].format(grade=grade,term=term)
+                await send_reply(phone, M["tracking_hdr"].format(grade=grade, term=term)
                                  + M["suggestion"].format(suggestions=suggestions))
 
         # ── Career Selection (top 5 list) ─────────────────────────
@@ -1160,12 +1402,18 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
             pathway = student[5]
             if not pathway: await send_reply(phone, M["no_pathway"]); return ""
             if text_clean.isdigit() and 1 <= int(text_clean) <= 5:
-                idx    = int(text_clean) - 1
-                career = SENIOR_CAREERS[pathway][idx][0]
-                sms_save(phone, "career_interest", career)
+                idx  = int(text_clean) - 1
+                name, demand, trend, subjects, unis, reqs = SENIOR_CAREERS[pathway][idx]
+                sms_save(phone, "career_interest", name)
                 sms_save(phone, "state", "DONE")
-                await send_reply(phone, M["career_saved"])
+                # Send static career detail first (fast, no Gemini latency)
                 await send_reply(phone, get_career_detail_sms(pathway, idx, lang))
+                # ── GEMINI #1: Personalised career narrative (second SMS) ──
+                grade = student[3] or ""
+                narrative = await gemini_career_narrative(
+                    grade, pathway, name, subjects, demand, lang
+                )
+                await send_reply(phone, narrative)
             elif text_upper == "MORE":
                 await send_reply(phone, get_all_careers_sms(pathway, lang))
                 sms_save(phone, "state", "CAREER_SELECT_ALL")
@@ -1177,12 +1425,17 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
             pathway = student[5]
             if not pathway: await send_reply(phone, M["no_pathway"]); return ""
             if text_clean.isdigit() and 1 <= int(text_clean) <= 10:
-                idx    = int(text_clean) - 1
-                career = SENIOR_CAREERS[pathway][idx][0]
-                sms_save(phone, "career_interest", career)
+                idx  = int(text_clean) - 1
+                name, demand, trend, subjects, unis, reqs = SENIOR_CAREERS[pathway][idx]
+                sms_save(phone, "career_interest", name)
                 sms_save(phone, "state", "DONE")
-                await send_reply(phone, M["career_saved"])
                 await send_reply(phone, get_career_detail_sms(pathway, idx, lang))
+                # ── GEMINI #1: Personalised career narrative ──────
+                grade = student[3] or ""
+                narrative = await gemini_career_narrative(
+                    grade, pathway, name, subjects, demand, lang
+                )
+                await send_reply(phone, narrative)
             else:
                 await send_reply(phone, M["invalid_career"])
 
