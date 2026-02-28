@@ -837,11 +837,12 @@ RULES:
 
 async def ask_gemini_rag(phone: str, question: str, lang: str) -> str:
     """
-    Mode 2: CBE Assistant — richer prompt, document context, conversation memory.
+    Mode 2: CBE Assistant.
+    Primary: Gemini's own training knowledge about Kenya CBE + conversation history.
+    Document context (DOCUMENT_CONTEXT) is a placeholder — populate it later
+    with retrieved chunks from your CBE PDFs to enable full RAG.
+    Falls back to a static message only if Gemini is completely unavailable.
     """
-    if not GEMINI_KEY:
-        return "CBE Assistant is not configured yet. Reply MENU to go back."
-
     history = get_chat_history(phone, limit=8)
     history_text = "".join(f"{r.upper()}: {m}\n" for r, m in history)
 
@@ -851,7 +852,15 @@ async def ask_gemini_rag(phone: str, question: str, lang: str) -> str:
         "ki": "Respond in simple Kikuyu mixed with English.",
     }.get(lang, "Respond in English.")
 
-    system = CBE_ASSISTANT_SYSTEM.format(document_context=DOCUMENT_CONTEXT)
+    # Build system — inject document context only when it has real content
+    doc_section = ""
+    if DOCUMENT_CONTEXT.strip() and not DOCUMENT_CONTEXT.strip().startswith("["):
+        doc_section = f"\nREFERENCE DOCUMENTS:\n{DOCUMENT_CONTEXT}\n"
+
+    system = (
+        CBE_ASSISTANT_SYSTEM.format(document_context=doc_section or
+        "(No documents linked yet — use your own knowledge about Kenya CBE/CBC curriculum.)")
+    )
 
     prompt = (
         f"{system}\n\n"
@@ -860,6 +869,13 @@ async def ask_gemini_rag(phone: str, question: str, lang: str) -> str:
         f"STUDENT: {question}\n\n"
         f"EDUTENA (2 SMS max, warm, helpful, end with encouragement):"
     )
+
+    if not GEMINI_KEY:
+        # No Gemini key configured at all
+        return (
+            "CBE Assistant is not fully configured yet.\n"
+            "Reply MENU to go back or START to restart."
+        )
 
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -1143,32 +1159,7 @@ def get_paused_state(state: str) -> str | None:
     return None
 
 
-# ── Resume message per language ──────────────────────────────
-RESUME_PROMPTS = {
-    "LANG":            {"en": LANG_SELECT_MSG, "sw": LANG_SELECT_MSG, "lh": LANG_SELECT_MSG, "ki": LANG_SELECT_MSG},
-    "LEVEL":           {l: SMS_MENU[l]["welcome"] for l in SMS_MENU},
-    "JSS_GRADE":       {l: SMS_MENU[l]["jss_grade"] for l in SMS_MENU},
-    "SENIOR_GRADE":    {l: SMS_MENU[l]["senior_grade"] for l in SMS_MENU},
-    "TERM":            {l: SMS_MENU[l]["term"] for l in SMS_MENU},
-    "SENIOR_PATHWAY":  {l: SMS_MENU[l]["senior_pathway"] for l in SMS_MENU},
-    "MATH":            {l: f"Rate Math:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
-    "SCIENCE":         {l: f"Rate Science:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
-    "SOCIAL":          {l: f"Rate Social Studies:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
-    "CREATIVE":        {l: f"Rate Creative Arts:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
-    "TECH":            {l: f"Rate Technical Skills:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
-}
-
-def get_resume_prompt(original_state: str, lang: str, student) -> str:
-    """Return the correct re-prompt message for a given state."""
-    mapping = RESUME_PROMPTS.get(original_state)
-    if mapping:
-        return mapping.get(lang, mapping.get("en", "Reply START to begin."))
-    # For CAREER_SELECT we need the pathway
-    if original_state == "CAREER_SELECT":
-        pathway = student[5] or ""
-        grade   = student[3] or ""
-        return get_career_list_sms(pathway, lang, grade)
-    return "Reply START to begin your assessment."
+# RESUME_PROMPTS and get_resume_prompt are defined after SMS_MENU below
 
 
 # =============================================================
@@ -1315,6 +1306,33 @@ SMS_MENU = {
         "invalid_career": "Ti wegwaru. Cookia nambari kutoka orodha ya mirimo.",
     },
 }
+
+
+# ── Resume message per language ──────────────────────────────
+# Defined here — after LANG_SELECT_MSG and SMS_MENU are available.
+RESUME_PROMPTS = {
+    "LANG":           {"en": LANG_SELECT_MSG, "sw": LANG_SELECT_MSG, "lh": LANG_SELECT_MSG, "ki": LANG_SELECT_MSG},
+    "LEVEL":          {l: SMS_MENU[l]["welcome"] for l in SMS_MENU},
+    "JSS_GRADE":      {l: SMS_MENU[l]["jss_grade"] for l in SMS_MENU},
+    "SENIOR_GRADE":   {l: SMS_MENU[l]["senior_grade"] for l in SMS_MENU},
+    "TERM":           {l: SMS_MENU[l]["term"] for l in SMS_MENU},
+    "SENIOR_PATHWAY": {l: SMS_MENU[l]["senior_pathway"] for l in SMS_MENU},
+    "MATH":           {l: f"Rate Math:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
+    "SCIENCE":        {l: f"Rate Science:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
+    "SOCIAL":         {l: f"Rate Social Studies:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
+    "CREATIVE":       {l: f"Rate Creative Arts:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
+    "TECH":           {l: f"Rate Technical Skills:\n{RATING_OPTIONS_SMS}" for l in SMS_MENU},
+}
+
+def get_resume_prompt(original_state: str, lang: str, student) -> str:
+    mapping = RESUME_PROMPTS.get(original_state)
+    if mapping:
+        return mapping.get(lang, mapping.get("en", "Reply START to begin."))
+    if original_state == "CAREER_SELECT":
+        pathway = student[5] or ""
+        grade   = student[3] or ""
+        return get_career_list_sms(pathway, lang, grade)
+    return "Reply START to begin your assessment."
 
 
 # =============================================================
