@@ -835,14 +835,56 @@ RULES:
 - NEVER give medical, legal, or financial investment advice
 """
 
+async def gemini_call(prompt: str, max_tokens: int, temperature: float, label: str) -> str | None:
+    """
+    Shared Gemini API caller with full error logging.
+    Returns the text string on success, None on any failure.
+    Logs the full error so you can see exactly what Gemini returned.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature},
+                }
+            )
+            data = response.json()
+            print(f"[{label}] HTTP {response.status_code} | keys: {list(data.keys())}")
+
+            if "error" in data:
+                print(f"[{label}] API error: {data['error']}")
+                return None
+
+            candidates = data.get("candidates", [])
+            if not candidates:
+                print(f"[{label}] Empty candidates. Full response: {data}")
+                return None
+
+            candidate = candidates[0]
+            finish = candidate.get("finishReason", "")
+            if finish == "SAFETY":
+                print(f"[{label}] Blocked by safety filter")
+                return "__SAFETY__"
+
+            return candidate["content"]["parts"][0]["text"].strip()
+
+    except Exception as e:
+        print(f"[{label}] Exception {type(e).__name__}: {e}")
+        return None
+
+
+
 async def ask_gemini_rag(phone: str, question: str, lang: str) -> str:
     """
     Mode 2: CBE Assistant.
-    Primary: Gemini's own training knowledge about Kenya CBE + conversation history.
-    Document context (DOCUMENT_CONTEXT) is a placeholder — populate it later
-    with retrieved chunks from your CBE PDFs to enable full RAG.
-    Falls back to a static message only if Gemini is completely unavailable.
+    Uses Gemini's own knowledge about Kenya CBE as primary source.
+    When DOCUMENT_CONTEXT is populated with real content, it becomes full RAG.
     """
+    if not GEMINI_KEY:
+        return "CBE Assistant is not fully configured yet. Reply MENU to go back."
+
     history = get_chat_history(phone, limit=8)
     history_text = "".join(f"{r.upper()}: {m}\n" for r, m in history)
 
@@ -852,15 +894,12 @@ async def ask_gemini_rag(phone: str, question: str, lang: str) -> str:
         "ki": "Respond in simple Kikuyu mixed with English.",
     }.get(lang, "Respond in English.")
 
-    # Build system — inject document context only when it has real content
-    doc_section = ""
-    if DOCUMENT_CONTEXT.strip() and not DOCUMENT_CONTEXT.strip().startswith("["):
-        doc_section = f"\nREFERENCE DOCUMENTS:\n{DOCUMENT_CONTEXT}\n"
-
-    system = (
-        CBE_ASSISTANT_SYSTEM.format(document_context=doc_section or
-        "(No documents linked yet — use your own knowledge about Kenya CBE/CBC curriculum.)")
+    doc_section = (
+        f"\nREFERENCE DOCUMENTS:\n{DOCUMENT_CONTEXT}\n"
+        if DOCUMENT_CONTEXT.strip() and not DOCUMENT_CONTEXT.strip().startswith("[")
+        else "(No documents linked yet — use your own knowledge about Kenya CBE/CBC curriculum.)"
     )
+    system = CBE_ASSISTANT_SYSTEM.format(document_context=doc_section)
 
     prompt = (
         f"{system}\n\n"
@@ -870,32 +909,18 @@ async def ask_gemini_rag(phone: str, question: str, lang: str) -> str:
         f"EDUTENA (2 SMS max, warm, helpful, end with encouragement):"
     )
 
-    if not GEMINI_KEY:
-        # No Gemini key configured at all
-        return (
-            "CBE Assistant is not fully configured yet.\n"
-            "Reply MENU to go back or START to restart."
-        )
+    answer = await gemini_call(prompt, max_tokens=200, temperature=0.5, label="rag_chat")
 
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"maxOutputTokens": 200, "temperature": 0.5},
-                }
-            )
-            data   = response.json()
-            answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            save_chat(phone, "user", question)
-            save_chat(phone, "assistant", answer)
-            if "MENU" not in answer.upper():
-                answer += "\n\nReply MENU to return to the main menu."
-            return answer
-    except Exception as e:
-        print(f"[GEMINI rag_chat] Error: {e}")
+    if answer is None:
         return "Sorry, I could not answer that right now. Try again or reply MENU to go back."
+    if answer == "__SAFETY__":
+        return "I couldn't answer that safely. Please rephrase your question. Reply MENU to go back."
+
+    save_chat(phone, "user", question)
+    save_chat(phone, "assistant", answer)
+    if "MENU" not in answer.upper():
+        answer += "\n\nReply MENU to return to the main menu."
+    return answer
 
 
 # =============================================================
@@ -945,21 +970,10 @@ async def gemini_career_narrative(
         f"Message (2 sentences max):"
     )
 
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"maxOutputTokens": 100, "temperature": 0.7},
-                }
-            )
-            data   = response.json()
-            answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            return answer
-    except Exception as e:
-        print(f"[GEMINI career_narrative] Error: {e}")
+    answer = await gemini_call(prompt, max_tokens=100, temperature=0.7, label="career_narrative")
+    if not answer or answer == "__SAFETY__":
         return f"Excellent choice! In {grade}, focus hard on {subjects} — these are your foundation for becoming a {career}. Keep going, the Kenya job market needs you!"
+    return answer
 
 
 # =============================================================
@@ -1022,21 +1036,8 @@ async def gemini_jss_suggestions(
         f"Message (3 sentences max):"
     )
 
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"maxOutputTokens": 120, "temperature": 0.6},
-                }
-            )
-            data   = response.json()
-            answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            return answer
-    except Exception as e:
-        print(f"[GEMINI jss_suggestions] Error: {e}")
-        return fallback
+    answer = await gemini_call(prompt, max_tokens=120, temperature=0.6, label="jss_suggestions")
+    return answer if (answer and answer != "__SAFETY__") else fallback
 
 
 # =============================================================
@@ -1074,23 +1075,12 @@ async def ask_gemini(phone: str, question: str, context_state: str = "") -> str:
         f"or 'Reply START to begin.' if not."
     )
 
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"maxOutputTokens": 160, "temperature": 0.4},
-                }
-            )
-            data   = response.json()
-            answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            save_chat(phone, "user", question)
-            save_chat(phone, "assistant", answer)
-            return answer
-    except Exception as e:
-        print(f"[GEMINI ask] Error: {e}")
+    answer = await gemini_call(prompt, max_tokens=160, temperature=0.4, label="ask_gemini")
+    if not answer or answer == "__SAFETY__":
         return "Sorry, I could not answer that right now. Reply RESUME to continue your assessment."
+    save_chat(phone, "user", question)
+    save_chat(phone, "assistant", answer)
+    return answer
 
 
 def get_chat_history(phone: str, limit: int = 6):
