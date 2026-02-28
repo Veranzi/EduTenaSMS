@@ -3,6 +3,8 @@ from fastapi.responses import PlainTextResponse
 import psycopg2
 from urllib.parse import urlparse
 import os
+import httpx
+import asyncio
 import africastalking
 
 app = FastAPI()
@@ -10,14 +12,18 @@ app = FastAPI()
 AT_USERNAME = os.getenv("AT_USERNAME")
 AT_API_KEY  = os.getenv("AT_API_KEY")
 africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
-sms_service = africastalking.SMS
-SENDER_ID   = os.getenv("AT_SENDER_ID", "98449")
+sms_service  = africastalking.SMS
+SENDER_ID    = os.getenv("AT_SENDER_ID", "98449")
+GEMINI_KEY   = os.getenv("GEMINI_API_KEY", "")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 @app.get("/")
 def root():
     return {"status": "EduTena API is running", "endpoints": {"sms": "/sms", "ussd": "/ussd"}}
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# =============================================================
+#  DATABASE
+# =============================================================
 
 def get_connection():
     url = urlparse(DATABASE_URL)
@@ -28,47 +34,50 @@ def init_db():
     conn = get_connection()
     cur  = conn.cursor()
 
-    # SMS table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS students (
             phone TEXT PRIMARY KEY, lang TEXT DEFAULT 'en',
-            level TEXT, grade TEXT, term TEXT,
+            level TEXT, grade TEXT, term TEXT, pathway TEXT,
             math INTEGER, science INTEGER, social INTEGER,
             creative INTEGER, technical INTEGER,
-            pathway TEXT, state TEXT
+            career_interest TEXT, state TEXT
         )
     """)
-    for col in ["lang", "grade", "term"]:
+    for col in ["lang","grade","term","pathway","career_interest"]:
         cur.execute(f"ALTER TABLE students ADD COLUMN IF NOT EXISTS {col} TEXT")
 
-    # USSD table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ussd_students (
             phone TEXT PRIMARY KEY, lang TEXT DEFAULT 'en',
-            level TEXT, grade TEXT, term TEXT,
+            level TEXT, grade TEXT, term TEXT, pathway TEXT,
             math INTEGER, science INTEGER, social INTEGER,
             creative INTEGER, technical INTEGER,
-            pathway TEXT, state TEXT
+            career_interest TEXT, state TEXT
         )
     """)
-    for col in ["lang", "grade", "term"]:
+    for col in ["lang","grade","term","pathway","career_interest"]:
         cur.execute(f"ALTER TABLE ussd_students ADD COLUMN IF NOT EXISTS {col} TEXT")
 
-    # Clean corrupted rows where lang has wrong value (old schema leftover)
+    # SMS chat history table for Gemini RAG
     cur.execute("""
-        UPDATE students SET lang='en', state='LANG',
-            level=NULL, grade=NULL, term=NULL,
-            math=NULL, science=NULL, social=NULL,
-            creative=NULL, technical=NULL, pathway=NULL
-        WHERE lang NOT IN ('en','sw','lh','ki') OR lang IS NULL
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id SERIAL PRIMARY KEY,
+            phone TEXT,
+            role TEXT,
+            message TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
     """)
-    cur.execute("""
-        UPDATE ussd_students SET lang='en', state='LANG',
-            level=NULL, grade=NULL, term=NULL,
-            math=NULL, science=NULL, social=NULL,
-            creative=NULL, technical=NULL, pathway=NULL
-        WHERE lang NOT IN ('en','sw','lh','ki') OR lang IS NULL
-    """)
+
+    # Clean corrupted rows from old schema
+    for table in ["students", "ussd_students"]:
+        cur.execute(f"""
+            UPDATE {table} SET lang='en', state='LANG',
+                level=NULL, grade=NULL, term=NULL, pathway=NULL,
+                math=NULL, science=NULL, social=NULL,
+                creative=NULL, technical=NULL, career_interest=NULL
+            WHERE lang NOT IN ('en','sw','lh','ki') OR lang IS NULL
+        """)
 
     conn.commit()
     cur.close()
@@ -79,23 +88,19 @@ def startup():
     init_db()
 
 # =============================================================
-#  SHARED HELPERS
+#  SHARED CONSTANTS
 # =============================================================
 
-# CBE Grade structure:
-# JSS    → Grade 7, Grade 8, Grade 9
-# Senior → Grade 10, Grade 11, Grade 12
+# CBE Structure:
+# JSS    → Grade 7, 8, 9   (Junior Secondary)
+# Senior → Grade 10, 11, 12 (Senior Secondary)
 #
-# PURPOSE PER GRADE:
-# Grade 7  → Track performance + improvement suggestions
-# Grade 8  → Track performance + improvement suggestions
-# Grade 9  → Pathway PREDICTION (STEM / Social Sciences / Arts)
-# Grade 10 → Senior pathway tracking
-# Grade 11 → Senior pathway tracking
-# Grade 12 → Senior pathway tracking (final)
+# Grade 7 & 8  → Track performance + improvement suggestions
+# Grade 9      → Predict pathway (STEM / Social Sciences / Arts)
+# Grade 10-12  → Pathway-specific subjects + careers + market data
 
 RATING_MAP = {"1": 4, "2": 3, "3": 2, "4": 1}
-# 4=Exceeding, 3=Meeting, 2=Approaching, 1=Below
+# 4=Exceeding Expectation, 3=Meeting, 2=Approaching, 1=Below
 
 RATING_OPTIONS_SMS = (
     "1. Exceeding Expectation\n"
@@ -113,6 +118,350 @@ RATING_OPTIONS_USSD = (
 JSS_GRADES    = {"1": "Grade 7", "2": "Grade 8", "3": "Grade 9"}
 SENIOR_GRADES = {"1": "Grade 10", "2": "Grade 11", "3": "Grade 12"}
 TERMS         = {"1": "Term 1", "2": "Term 2", "3": "Term 3"}
+LANG_MAP      = {"1": "en", "2": "sw", "3": "lh", "4": "ki"}
+PATHWAYS      = {"1": "STEM", "2": "Social Sciences", "3": "Arts & Sports Science"}
+
+# =============================================================
+#  PATHWAY-SPECIFIC SUBJECTS FOR SENIOR (Grade 10-12)
+# =============================================================
+# Each pathway has its own 5 subjects that are rated
+
+SENIOR_SUBJECTS = {
+    "STEM": [
+        ("math",       "Mathematics"),
+        ("science",    "Physics/Chemistry"),
+        ("technical",  "Computer Science"),
+        ("social",     "Biology"),
+        ("creative",   "Agriculture/Tech"),
+    ],
+    "Social Sciences": [
+        ("math",       "Mathematics"),
+        ("social",     "History & Government"),
+        ("creative",   "Business Studies"),
+        ("science",    "Geography"),
+        ("technical",  "CRE/IRE"),
+    ],
+    "Arts & Sports Science": [
+        ("creative",   "Visual Arts/Music"),
+        ("social",     "Drama & Theatre"),
+        ("technical",  "Physical Education"),
+        ("math",       "Mathematics"),
+        ("science",    "Home Science/Tech"),
+    ],
+}
+
+def get_senior_subjects(pathway: str) -> list:
+    return SENIOR_SUBJECTS.get(pathway, SENIOR_SUBJECTS["STEM"])
+
+# State machine for Senior subject ratings
+SENIOR_STATES = ["S_SUBJ1", "S_SUBJ2", "S_SUBJ3", "S_SUBJ4", "S_SUBJ5"]
+SENIOR_DB_FIELDS = ["math", "science", "technical", "social", "creative"]
+
+# =============================================================
+#  KENYA LABOUR MARKET 2025 — CAREER DATA
+# =============================================================
+
+SENIOR_CAREERS = {
+    "STEM": [
+        # (name, demand★, salary KES/mo, trend, university_options, focus_subjects)
+        ("Software Engineer",        "5★", "80K-200K", "↑ Silicon Savannah boom",
+         "UoN, Strathmore, JKUAT, KU",
+         "Math, Computer Science, Physics"),
+        ("Data Scientist",           "5★", "70K-180K", "↑ Highest demand 2025",
+         "Strathmore, UoN, JKUAT",
+         "Math, Statistics, Computer Science"),
+        ("Cybersecurity Specialist", "5★", "90K-250K", "↑ Critical shortage",
+         "Strathmore, KU, JKUAT",
+         "Computer Science, Math, Physics"),
+        ("Renewable Energy Eng.",    "4★", "60K-150K", "↑ Green energy boom",
+         "UoN, JKUAT, Moi University",
+         "Physics, Chemistry, Math"),
+        ("Medical Doctor",           "4★", "80K-300K", "↑ Healthcare growing",
+         "UoN, Moi, KMTC",
+         "Biology, Chemistry, Physics"),
+        ("Pharmacist",               "4★", "50K-120K", "↑ Pharma sector rising",
+         "UoN, KU, Pharmacy Board Kenya",
+         "Chemistry, Biology, Math"),
+        ("Civil Engineer",           "4★", "55K-130K", "→ Steady, housing demand",
+         "UoN, JKUAT, Technical Univ. Kenya",
+         "Math, Physics, Technical Drawing"),
+        ("Lab Technician",           "3★", "25K-55K",  "→ Public sector mostly",
+         "KMTC, Kenya Polytechnic, KU",
+         "Biology, Chemistry, Physics"),
+        ("Architect",                "3★", "50K-120K", "→ Urban projects",
+         "UoN, TUK, JKUAT",
+         "Math, Physics, Art & Design"),
+        ("ICT Support",              "3★", "30K-70K",  "→ Steady countrywide",
+         "Kenya Polytechnic, KCA, Zetech",
+         "Computer Science, Math"),
+    ],
+    "Social Sciences": [
+        ("Accountant/Auditor",       "5★", "50K-150K", "↑ Most advertised 2025",
+         "Strathmore, UoN, KCA, ACCA",
+         "Math, Business Studies, Economics"),
+        ("Digital Marketer",         "4★", "35K-120K", "↑ 17% of job postings",
+         "Strathmore, USIU, KCA",
+         "Business, ICT, Communications"),
+        ("Finance Manager",          "5★", "80K-200K", "↑ Fintech driving demand",
+         "Strathmore, UoN, CFA Institute",
+         "Math, Business Studies, Economics"),
+        ("Lawyer/Advocate",          "4★", "60K-250K", "↑ Legal services growing",
+         "UoN, Moi, KU, Strathmore",
+         "History, CRE, English/Kiswahili"),
+        ("Sales Executive",          "4★", "30K-100K", "↑ Top 3 most hired role",
+         "Any university, KISM",
+         "Business, Communication, Economics"),
+        ("Human Resource Mgr",       "3★", "45K-120K", "→ Steady all sectors",
+         "UoN, KU, Moi, IHRM Kenya",
+         "Business, Sociology, Psychology"),
+        ("Economist",                "3★", "50K-130K", "→ Government & research",
+         "UoN, Moi, USIU",
+         "Math, Economics, Geography"),
+        ("Teacher/Educator",         "3★", "25K-60K",  "→ High need, CBC era",
+         "KU, Moi, Maseno, TTC Colleges",
+         "Any subject specialization"),
+        ("Psychologist",             "3★", "30K-80K",  "↑ Mental health growing",
+         "UoN, USIU, KU",
+         "Biology, CRE, Sociology"),
+        ("Journalist/Media",         "2★", "20K-60K",  "↓ Print down, digital up",
+         "USIU, Daystar, KU",
+         "English/Kiswahili, History, ICT"),
+    ],
+    "Arts & Sports Science": [
+        ("Graphic Designer/UI-UX",   "4★", "35K-120K", "↑ Digital economy boom",
+         "ADMI, Kenyatta, Limkokwing",
+         "Visual Arts, Computer Science, Math"),
+        ("Film & Content Creator",   "4★", "20K-150K", "↑ Social media economy",
+         "AFDA, ADMI, Daystar",
+         "Drama, Visual Arts, ICT"),
+        ("Physiotherapist",          "3★", "35K-90K",  "↑ Sports & healthcare",
+         "UoN, KU, KMTC",
+         "Physical Education, Biology, Chemistry"),
+        ("Sports Coach/Manager",     "3★", "25K-80K",  "→ Growing, academies",
+         "KU, Moi, Sports Kenya",
+         "Physical Education, Biology"),
+        ("Interior Designer",        "3★", "30K-100K", "↑ Urban housing boom",
+         "ADMI, TUK, Kenyatta",
+         "Visual Arts, Math, Technical Drawing"),
+        ("Tourism/Hospitality Mgr",  "3★", "30K-100K", "↑ Post-COVID recovery",
+         "Utalii College, KU, USIU",
+         "Geography, Business, Home Science"),
+        ("Fashion Designer",         "2★", "15K-80K",  "→ Niche but growing",
+         "Kenya Fashion Institute, ADMI",
+         "Visual Arts, Home Science, Business"),
+        ("Beauty & Wellness",        "3★", "20K-70K",  "↑ TVET boom",
+         "TVET Colleges, Kenya Beauty School",
+         "Home Science, Biology, Chemistry"),
+        ("Musician/Performer",       "2★", "Variable", "→ Competitive",
+         "Kenya Conservatoire, Daystar",
+         "Music, Drama, Visual Arts"),
+        ("Community Development",    "2★", "25K-60K",  "→ NGO sector",
+         "UoN, Moi, Catholic University",
+         "History, CRE, Sociology"),
+    ],
+}
+
+def get_career_list_sms(pathway: str, lang: str, grade: str) -> str:
+    """Top 5 careers for pathway with demand + salary. Student picks 1-5."""
+    careers = SENIOR_CAREERS.get(pathway, SENIOR_CAREERS["STEM"])
+    hdr = {
+        "en": f"{pathway} Careers | {grade}\nKenya Market 2025\nSelect your interest:\n",
+        "sw": f"Kazi za {pathway} | {grade}\nSoko Kenya 2025\nChagua hamu yako:\n",
+        "lh": f"Emilimo ya {pathway} | {grade}\nSoko Kenya 2025\nSena hamu yako:\n",
+        "ki": f"Mirimo ya {pathway} | {grade}\nSoko Kenya 2025\nThura hamu yako:\n",
+    }
+    msg = hdr.get(lang, hdr["en"])
+    for i, (name, stars, salary, trend, unis, subjects) in enumerate(careers[:5], 1):
+        msg += f"{i}. {name} {stars}\n   KES {salary} | {trend}\n"
+    footer = {
+        "en": "\nReply 1-5 to select career\nReply MORE to see all 10",
+        "sw": "\nJibu 1-5 kuchagua kazi\nJibu MORE kuona zote 10",
+        "lh": "\nJibu 1-5 okhuсena emilimo\nJibu MORE okhuona yote 10",
+        "ki": "\nCookia 1-5 guthura mirimo\nCookia MORE kuona yothe 10",
+    }
+    msg += footer.get(lang, footer["en"])
+    return msg
+
+def get_career_detail_sms(pathway: str, career_idx: int, lang: str) -> str:
+    """Full detail for selected career — universities + subjects to focus on."""
+    careers = SENIOR_CAREERS.get(pathway, SENIOR_CAREERS["STEM"])
+    if career_idx < 0 or career_idx >= len(careers):
+        return "Invalid selection."
+    name, stars, salary, trend, unis, subjects = careers[career_idx]
+    msgs = {
+        "en": (
+            f"Career: {name}\n"
+            f"Market Demand: {stars}\n"
+            f"Salary: KES {salary}/mo\n"
+            f"Trend: {trend}\n\n"
+            f"Universities/Colleges:\n{unis}\n\n"
+            f"Focus Subjects:\n{subjects}\n\n"
+            f"Saved to your profile!\nReply START to reassess."
+        ),
+        "sw": (
+            f"Kazi: {name}\n"
+            f"Mahitaji: {stars}\n"
+            f"Mshahara: KES {salary}/mwezi\n"
+            f"Mwelekeo: {trend}\n\n"
+            f"Vyuo:\n{unis}\n\n"
+            f"Masomo ya Kuzingatia:\n{subjects}\n\n"
+            f"Imehifadhiwa!\nJibu START kuanza upya."
+        ),
+        "lh": (
+            f"Emilimo: {name}\n"
+            f"Haja: {stars}\n"
+            f"Mishahara: KES {salary}/mwezi\n\n"
+            f"Vyuo:\n{unis}\n\n"
+            f"Masomo:\n{subjects}\n\n"
+            f"Imehifadhiwa!\nJibu START okhuanza."
+        ),
+        "ki": (
+            f"Murimo: {name}\n"
+            f"Hitaji: {stars}\n"
+            f"Mshahara: KES {salary}/mwezi\n\n"
+            f"Vyuo:\n{unis}\n\n"
+            f"Masomo:\n{subjects}\n\n"
+            f"Niikuura!\nCookia START gutomia."
+        ),
+    }
+    return msgs.get(lang, msgs["en"])
+
+def get_all_careers_sms(pathway: str, lang: str) -> str:
+    """All 10 careers — sent when student replies MORE."""
+    careers = SENIOR_CAREERS.get(pathway, SENIOR_CAREERS["STEM"])
+    hdr = {
+        "en": f"All {pathway} Careers\nKenya Market 2025\nSelect your interest:\n",
+        "sw": f"Kazi Zote za {pathway}\nSoko Kenya 2025\nChagua:\n",
+        "lh": f"Emilimo Yote ya {pathway}\nSoko Kenya 2025\nSena:\n",
+        "ki": f"Mirimo Yothe ya {pathway}\nSoko Kenya 2025\nThura:\n",
+    }
+    msg = hdr.get(lang, hdr["en"])
+    for i, (name, stars, salary, trend, unis, subjects) in enumerate(careers, 1):
+        msg += f"{i}. {name} {stars} KES {salary}\n"
+    footer = {
+        "en": "\nReply 1-10 to select your career interest.",
+        "sw": "\nJibu 1-10 kuchagua kazi yako.",
+        "lh": "\nJibu 1-10 okhuсena emilimo yako.",
+        "ki": "\nCookia 1-10 guthura murimo waku.",
+    }
+    msg += footer.get(lang, footer["en"])
+    return msg
+
+def get_career_ussd_list(pathway: str) -> str:
+    """Compact USSD career list — name + stars only."""
+    careers = SENIOR_CAREERS.get(pathway, SENIOR_CAREERS["STEM"])
+    lines = f"{pathway}\nSelect Career Interest:\n"
+    for i, (name, stars, salary, trend, unis, subjects) in enumerate(careers[:6], 1):
+        short = name[:16] if len(name) > 16 else name
+        lines += f"{i}. {short} {stars}\n"
+    lines += "7. More careers"
+    return lines
+
+# =============================================================
+#  GEMINI RAG — CBE KNOWLEDGE BASE
+# =============================================================
+
+CBE_KNOWLEDGE = """
+You are EduTena, a Kenya CBE (Competency Based Education) assistant.
+You ONLY answer questions about:
+- Kenya CBC/CBE curriculum structure
+- JSS (Junior Secondary School) Grade 7, 8, 9
+- Senior Secondary School Grade 10, 11, 12
+- CBE pathways: STEM, Social Sciences, Arts & Sports Science
+- The 4 CBE performance levels: Exceeding Expectation (4), Meeting Expectation (3),
+  Approaching Expectation (2), Below Expectation (1)
+- Subject areas: Math, Science, Social Studies, Creative Arts, Technical Skills
+- Career guidance aligned to CBC pathways
+- Kenyan universities and colleges for each pathway
+- Kenya labour market and job demand by pathway
+- How parents and students can navigate the CBC system
+- Term assessments and how pathway selection works in Grade 9
+
+RULES:
+- Keep answers SHORT — max 3 sentences (this is SMS, character limit matters)
+- Be warm, encouraging, speak like a Kenyan educator
+- If asked something NOT about CBE/CBC Kenya education, say:
+  "I can only help with CBE/CBC education questions. Reply START to continue assessment."
+- Never give medical, legal, or financial investment advice
+- Always end with an encouraging phrase for the student
+"""
+
+async def ask_gemini(phone: str, question: str) -> str:
+    """
+    Send question to Gemini with CBE RAG context.
+    Includes last 3 exchanges for conversation memory.
+    """
+    if not GEMINI_KEY:
+        return "AI assistant not configured. Reply START to continue your assessment."
+
+    # Get last 3 exchanges from chat history
+    history = get_chat_history(phone, limit=6)
+    history_text = ""
+    for role, msg in history:
+        history_text += f"{role.upper()}: {msg}\n"
+
+    prompt = (
+        f"{CBE_KNOWLEDGE}\n\n"
+        f"CONVERSATION HISTORY:\n{history_text}\n"
+        f"STUDENT QUESTION: {question}\n\n"
+        f"Answer in max 3 short sentences suitable for SMS:"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": 150,
+                        "temperature": 0.4,
+                    }
+                }
+            )
+            data   = response.json()
+            answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            # Save to history
+            save_chat(phone, "user", question)
+            save_chat(phone, "assistant", answer)
+            return answer
+    except Exception as e:
+        print(f"[GEMINI] Error: {e}")
+        return "Sorry, I could not answer that right now. Reply START to continue your assessment."
+
+def get_chat_history(phone: str, limit: int = 6):
+    conn = get_connection(); cur = conn.cursor()
+    cur.execute("""
+        SELECT role, message FROM chat_history
+        WHERE phone=%s ORDER BY created_at DESC LIMIT %s
+    """, (phone, limit))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return list(reversed(rows))
+
+def save_chat(phone: str, role: str, message: str):
+    conn = get_connection(); cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO chat_history(phone, role, message) VALUES(%s,%s,%s)",
+        (phone, role, message)
+    )
+    conn.commit(); cur.close(); conn.close()
+
+def is_cbe_question(text: str) -> bool:
+    """Detect if student is asking a question (not a menu digit or command)."""
+    commands = {"START","CAREERS","MORE","1","2","3","4","5","6","7","8","9","10",
+                "EN","SW","LH","KI","HELP"}
+    text_upper = text.strip().upper()
+    if text_upper in commands:
+        return False
+    # If it's longer than 3 chars and not a single digit — treat as a question
+    if len(text.strip()) > 3 and not text.strip().isdigit():
+        return True
+    return False
+
+# =============================================================
+#  PATHWAY CALCULATOR (JSS Grade 9)
+# =============================================================
 
 def calculate_pathway_from_scores(math, science, social, creative, technical):
     stem         = (math or 0) + (science or 0) + (technical or 0)
@@ -125,48 +474,38 @@ def calculate_pathway_from_scores(math, science, social, creative, technical):
     else:
         return "Arts & Sports Science"
 
+# =============================================================
+#  IMPROVEMENT SUGGESTIONS (Grade 7, 8)
+# =============================================================
+
 def get_improvement_suggestions(math, science, social, creative, technical, lang="en"):
-    """
-    For Grade 7 & 8: identify weak subjects (score <= 2 = Approaching or Below)
-    and return suggestions in the chosen language.
-    """
     weak = []
-    subjects = {
-        "Math": math, "Science": science, "Social Studies": social,
-        "Creative Arts": creative, "Technical Skills": technical
-    }
-    subjects_sw = {
-        "Math": "Hisabati", "Science": "Sayansi", "Social Studies": "Sayansi Jamii",
-        "Creative Arts": "Sanaa", "Technical Skills": "Ujuzi wa Kiufundi"
-    }
+    subjects    = {"Math": math, "Science": science, "Social Studies": social,
+                   "Creative Arts": creative, "Technical Skills": technical}
+    subjects_sw = {"Math": "Hisabati", "Science": "Sayansi",
+                   "Social Studies": "Sayansi Jamii",
+                   "Creative Arts": "Sanaa", "Technical Skills": "Ujuzi wa Kiufundi"}
     for subj, score in subjects.items():
         if (score or 0) <= 2:
-            weak.append(subjects_sw[subj] if lang == "sw" else subj)
+            weak.append(subjects_sw[subj] if lang in ("sw","lh","ki") else subj)
 
     if not weak:
-        msgs = {
-            "en": "Excellent! Keep it up. You are on track in all subjects!",
-            "sw": "Vizuri sana! Endelea hivyo. Uko vizuri katika masomo yote!",
-            "lh": "Wewe omulahi! Endelea. Uko sawa kwa masomo yote!",
-            "ki": "Uria mwega! Endelea. Uri mwega kwa masomo mothe!",
-        }
-        return msgs.get(lang, msgs["en"])
-
+        return {"en": "Excellent! You are on track in all subjects. Keep it up!",
+                "sw": "Vizuri sana! Uko vizuri katika masomo yote. Endelea!",
+                "lh": "Wewe omulahi! Uko sawa kwa masomo yote. Endelea!",
+                "ki": "Uria mwega! Uri mwega kwa masomo mothe. Endelea!"}.get(lang,"")
     weak_str = ", ".join(weak)
-    msgs = {
-        "en": f"Focus on improving: {weak_str}.\nStudy more, ask your teacher for help, and practice regularly.",
-        "sw": f"Jaribu kuboresha: {weak_str}.\nSoma zaidi, uliza mwalimu wako msaada, na fanya mazoezi mara kwa mara.",
-        "lh": f"Jaribu okhukoresa: {weak_str}.\nSoma khale, omba mwalimu msaada, na fanya mazoezi.",
-        "ki": f"Thiini guthoma: {weak_str}.\nThoma na hinya, uiguithia mwarimu, na ithima mara nyingi.",
-    }
-    return msgs.get(lang, msgs["en"])
-
+    return {
+        "en": f"Work harder on: {weak_str}. Ask your teacher for extra help and practice daily.",
+        "sw": f"Jaribu zaidi: {weak_str}. Omba mwalimu msaada na fanya mazoezi kila siku.",
+        "lh": f"Jaribu khale: {weak_str}. Omba mwalimu msaada na fanya mazoezi.",
+        "ki": f"Thiini guthoma: {weak_str}. Uiguithia mwarimu na ithima mara nyingi.",
+    }.get(lang, "")
 
 # =============================================================
 #  LANGUAGE MENUS
 # =============================================================
 
-# Always start in English for language selection — then switch
 LANG_SELECT_MSG = (
     "Welcome to EduTena CBE.\n"
     "Select Language:\n"
@@ -176,124 +515,104 @@ LANG_SELECT_MSG = (
     "4. Kikuyu"
 )
 
-LANG_MAP = {"1": "en", "2": "sw", "3": "lh", "4": "ki"}
-
 SMS_MENU = {
     "en": {
         "lang_confirm":  "Language: English\nReply START to begin.",
         "welcome":       "EduTena CBE\nSelect Level:\n1. JSS (Grade 7-9)\n2. Senior (Grade 10-12)",
-        "level_err":     "Invalid. Select:\n1. JSS (Gr 7-9)\n2. Senior (Gr 10-12)",
+        "level_err":     "Invalid. Reply 1 for JSS or 2 for Senior.",
         "jss_grade":     "Select JSS Grade:\n1. Grade 7\n2. Grade 8\n3. Grade 9",
         "senior_grade":  "Select Senior Grade:\n1. Grade 10\n2. Grade 11\n3. Grade 12",
-        "grade_err":     "Invalid. Select grade 1, 2, or 3.",
+        "grade_err":     "Invalid. Select 1, 2, or 3.",
         "term":          "Select Term:\n1. Term 1\n2. Term 2\n3. Term 3",
         "term_err":      "Invalid. Select term 1, 2, or 3.",
-        "math":          f"Rate Math:\n{RATING_OPTIONS_SMS}",
-        "science":       f"Rate Science:\n{RATING_OPTIONS_SMS}",
-        "social":        f"Rate Social Studies:\n{RATING_OPTIONS_SMS}",
-        "creative":      f"Rate Creative Arts:\n{RATING_OPTIONS_SMS}",
-        "tech":          f"Rate Technical Skills:\n{RATING_OPTIONS_SMS}",
+        "senior_pathway":"Select your Senior Pathway:\n1. STEM\n2. Social Sciences\n3. Arts & Sports Science",
+        "pathway_err":   "Invalid. Select 1, 2, or 3.",
         "invalid":       "Invalid. Reply 1, 2, 3, or 4.",
-        # Grade 7 & 8 — performance tracking
-        "tracking_hdr":  "Performance Summary\n{grade} | {term}\n",
-        "suggestion":    "{suggestions}\nReply START to reassess.",
-        # Grade 9 — pathway prediction
-        "pathway_msg":   "Predicted Pathway:\n{pathway}\n(Based on Grade 9 scores)\nReply CAREERS to see options.",
-        # Senior — tracking
-        "senior_msg":    "Senior Performance\n{grade} | {term}\n{suggestions}\nReply START to reassess.",
-        "careers_stem":  "STEM Careers:\n- Engineering\n- Data Science\n- Medicine\n- Architecture\n- Pharmacy",
-        "careers_soc":   "Social Sciences:\n- Law\n- Psychology\n- Economics\n- Education\n- Journalism",
-        "careers_arts":  "Arts & Sports:\n- Design\n- Music\n- Sports Science\n- Film & Media\n- Fashion",
+        "pathway_msg":   "Predicted Pathway: {pathway}\nBased on your Grade 9 scores.\nReply CAREERS to see options.",
+        "tracking_hdr":  "Performance: {grade} | {term}\n",
+        "suggestion":    "{suggestions}\nYou can also ask any CBE question by texting it!",
+        "senior_perf":   "Performance: {grade} | {term}\n{suggestions}",
         "no_pathway":    "Complete assessment first. Reply START.",
-        "done":          "Assessment saved.\nReply CAREERS or START to reassess.",
+        "done":          "Assessment saved. Reply CAREERS or ask any CBE question!",
+        "career_saved":  "Career interest saved!",
+        "invalid_career":"Invalid. Reply a number from the career list.",
     },
     "sw": {
         "lang_confirm":  "Lugha: Kiswahili\nJibu START kuanza.",
         "welcome":       "EduTena CBE\nChagua Kiwango:\n1. JSS (Darasa 7-9)\n2. Sekondari (Darasa 10-12)",
-        "level_err":     "Batili. Chagua:\n1. JSS\n2. Sekondari",
+        "level_err":     "Batili. Jibu 1 kwa JSS au 2 kwa Sekondari.",
         "jss_grade":     "Chagua Darasa la JSS:\n1. Darasa 7\n2. Darasa 8\n3. Darasa 9",
         "senior_grade":  "Chagua Darasa la Sekondari:\n1. Darasa 10\n2. Darasa 11\n3. Darasa 12",
-        "grade_err":     "Batili. Chagua darasa 1, 2, au 3.",
+        "grade_err":     "Batili. Chagua 1, 2, au 3.",
         "term":          "Chagua Muhula:\n1. Muhula 1\n2. Muhula 2\n3. Muhula 3",
         "term_err":      "Batili. Chagua muhula 1, 2, au 3.",
-        "math":          "Kadiria Hisabati:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia\n4. Chini",
-        "science":       "Kadiria Sayansi:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia\n4. Chini",
-        "social":        "Kadiria Sayansi Jamii:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia\n4. Chini",
-        "creative":      "Kadiria Sanaa:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia\n4. Chini",
-        "tech":          "Kadiria Ujuzi wa Kiufundi:\n1. Kuzidi\n2. Kukidhi\n3. Kukaribia\n4. Chini",
+        "senior_pathway":"Chagua Njia yako ya Sekondari:\n1. STEM\n2. Sayansi Jamii\n3. Sanaa & Michezo",
+        "pathway_err":   "Batili. Chagua 1, 2, au 3.",
         "invalid":       "Batili. Jibu 1, 2, 3, au 4.",
-        "tracking_hdr":  "Muhtasari wa Utendaji\n{grade} | {term}\n",
-        "suggestion":    "{suggestions}\nJibu START kuanza upya.",
-        "pathway_msg":   "Njia Inayotabirika:\n{pathway}\n(Kulingana na alama za Darasa 9)\nJibu CAREERS kuona kazi.",
-        "senior_msg":    "Utendaji wa Sekondari\n{grade} | {term}\n{suggestions}\nJibu START kuanza upya.",
-        "careers_stem":  "Kazi za STEM:\n- Uhandisi\n- Sayansi ya Data\n- Dawa\n- Usanifu\n- Famasia",
-        "careers_soc":   "Sayansi Jamii:\n- Sheria\n- Saikolojia\n- Uchumi\n- Elimu\n- Uandishi",
-        "careers_arts":  "Sanaa & Michezo:\n- Usanifu\n- Muziki\n- Sayansi ya Michezo\n- Filamu\n- Mitindo",
+        "pathway_msg":   "Njia Inayotabirika: {pathway}\nJibu CAREERS kuona kazi.",
+        "tracking_hdr":  "Utendaji: {grade} | {term}\n",
+        "suggestion":    "{suggestions}\nUnaweza pia kuuliza swali lolote la CBE!",
+        "senior_perf":   "Utendaji: {grade} | {term}\n{suggestions}",
         "no_pathway":    "Maliza tathmini kwanza. Jibu START.",
-        "done":          "Tathmini imehifadhiwa.\nJibu CAREERS au START kuanza upya.",
+        "done":          "Imehifadhiwa. Jibu CAREERS au uliza swali lolote la CBE!",
+        "career_saved":  "Kazi yako imehifadhiwa!",
+        "invalid_career":"Batili. Jibu nambari kutoka kwenye orodha ya kazi.",
     },
     "lh": {
         "lang_confirm":  "Olulimi: Luhya\nJibu START okhuandaa.",
         "welcome":       "EduTena CBE\nSena Engufu:\n1. JSS (Okhufunda 7-9)\n2. Sekondari (Okhufunda 10-12)",
-        "level_err":     "Busia. Sena:\n1. JSS\n2. Sekondari",
+        "level_err":     "Busia. Jibu 1 kwa JSS kamba 2 kwa Sekondari.",
         "jss_grade":     "Sena Okhufunda lwa JSS:\n1. Okhufunda 7\n2. Okhufunda 8\n3. Okhufunda 9",
         "senior_grade":  "Sena Okhufunda lwa Sekondari:\n1. Okhufunda 10\n2. Okhufunda 11\n3. Okhufunda 12",
-        "grade_err":     "Busia. Sena okhufunda 1, 2, kamba 3.",
+        "grade_err":     "Busia. Sena 1, 2, kamba 3.",
         "term":          "Sena Muhula:\n1. Muhula 1\n2. Muhula 2\n3. Muhula 3",
         "term_err":      "Busia. Sena muhula 1, 2, kamba 3.",
-        "math":          "Kadiria Hesabu:\n1. Okhupiha\n2. Okhufika\n3. Okhuneela\n4. Wansi",
-        "science":       "Kadiria Sayansi:\n1. Okhupiha\n2. Okhufika\n3. Okhuneela\n4. Wansi",
-        "social":        "Kadiria Elimu ya Jamii:\n1. Okhupiha\n2. Okhufika\n3. Okhuneela\n4. Wansi",
-        "creative":      "Kadiria Sanaa:\n1. Okhupiha\n2. Okhufika\n3. Okhuneela\n4. Wansi",
-        "tech":          "Kadiria Ujuzi wa Kiufundi:\n1. Okhupiha\n2. Okhufika\n3. Okhuneela\n4. Wansi",
+        "senior_pathway":"Sena Njia yako ya Sekondari:\n1. STEM\n2. Sayansi Jamii\n3. Sanaa & Michezo",
+        "pathway_err":   "Busia. Sena 1, 2, kamba 3.",
         "invalid":       "Busia. Jibu 1, 2, 3, kamba 4.",
-        "tracking_hdr":  "Okusema kwa Masomo\n{grade} | {term}\n",
-        "suggestion":    "{suggestions}\nJibu START okhuanza.",
-        "pathway_msg":   "Njia Enyiseniwe:\n{pathway}\nJibu CAREERS okhuona emilimo.",
-        "senior_msg":    "Okusema kwa Sekondari\n{grade} | {term}\n{suggestions}\nJibu START okhuanza.",
-        "careers_stem":  "Emilimo ya STEM:\n- Uhandisi\n- Sayansi ya Data\n- Dawa\n- Usanifu\n- Famasia",
-        "careers_soc":   "Elimu ya Jamii:\n- Sheria\n- Saikolojia\n- Uchumi\n- Elimu\n- Habari",
-        "careers_arts":  "Sanaa & Michezo:\n- Usanifu\n- Muziki\n- Sayansi ya Michezo\n- Filamu\n- Mitindo",
+        "pathway_msg":   "Njia Enyiseniwe: {pathway}\nJibu CAREERS okhuona emilimo.",
+        "tracking_hdr":  "Okusema: {grade} | {term}\n",
+        "suggestion":    "{suggestions}\nUnaweza pia kuuliza swali lolote la CBE!",
+        "senior_perf":   "Okusema: {grade} | {term}\n{suggestions}",
         "no_pathway":    "Maliza tathmini kwanza. Jibu START.",
-        "done":          "Tathmini yakhwira.\nJibu CAREERS kamba START okhuanza.",
+        "done":          "Yakhwira. Jibu CAREERS kamba uliza swali la CBE!",
+        "career_saved":  "Emilimo yako imehifadhiwa!",
+        "invalid_career":"Busia. Jibu nambari kutoka orodha ya emilimo.",
     },
     "ki": {
         "lang_confirm":  "Rurimi: Kikuyu\nCookia START guthomia.",
         "welcome":       "EduTena CBE\nThura Kiwango:\n1. JSS (Kiwango 7-9)\n2. Sekondari (Kiwango 10-12)",
-        "level_err":     "Ti wegwaru. Thura:\n1. JSS\n2. Sekondari",
+        "level_err":     "Ti wegwaru. Cookia 1 JSS kana 2 Sekondari.",
         "jss_grade":     "Thura Kiwango kia JSS:\n1. Kiwango 7\n2. Kiwango 8\n3. Kiwango 9",
         "senior_grade":  "Thura Kiwango kia Sekondari:\n1. Kiwango 10\n2. Kiwango 11\n3. Kiwango 12",
-        "grade_err":     "Ti wegwaru. Thura kiwango 1, 2, kana 3.",
+        "grade_err":     "Ti wegwaru. Thura 1, 2, kana 3.",
         "term":          "Thura Muhula:\n1. Muhula 1\n2. Muhula 2\n3. Muhula 3",
-        "term_err":      "Ti wegwaru. Thura muhula 1, 2, kana 3.",
-        "math":          "Kadiria Hesabu:\n1. Gucokia\n2. Gufika\n3. Guserekania\n4. Hasi",
-        "science":       "Kadiria Sayansi:\n1. Gucokia\n2. Gufika\n3. Guserekania\n4. Hasi",
-        "social":        "Kadiria Maarifa ya Jamii:\n1. Gucokia\n2. Gufika\n3. Guserekania\n4. Hasi",
-        "creative":      "Kadiria Sanaa:\n1. Gucokia\n2. Gufika\n3. Guserekania\n4. Hasi",
-        "tech":          "Kadiria Ujuzi wa Kiufundi:\n1. Gucokia\n2. Gufika\n3. Guserekania\n4. Hasi",
+        "term_err":      "Ti wegwaru. Thura 1, 2, kana 3.",
+        "senior_pathway":"Thura Njia yaku ya Sekondari:\n1. STEM\n2. Sayansi Jamii\n3. Sanaa & Michezo",
+        "pathway_err":   "Ti wegwaru. Thura 1, 2, kana 3.",
         "invalid":       "Ti wegwaru. Cookia 1, 2, 3, kana 4.",
-        "tracking_hdr":  "Mahitio ma Guthoma\n{grade} | {term}\n",
-        "suggestion":    "{suggestions}\nCookia START gutomia.",
-        "pathway_msg":   "Njia Yoneneirwo:\n{pathway}\nCookia CAREERS kuona mirimo.",
-        "senior_msg":    "Mahitio ma Sekondari\n{grade} | {term}\n{suggestions}\nCookia START gutomia.",
-        "careers_stem":  "Mirimo ya STEM:\n- Uhandisi\n- Sayansi ya Data\n- Dawa\n- Usanifu\n- Famasia",
-        "careers_soc":   "Maarifa ya Jamii:\n- Sheria\n- Saikolojia\n- Uchumi\n- Elimu\n- Habari",
-        "careers_arts":  "Sanaa & Michezo:\n- Usanifu\n- Muziki\n- Sayansi ya Michezo\n- Filamu\n- Mitindo",
+        "pathway_msg":   "Njia Yoneneirwo: {pathway}\nCookia CAREERS kuona mirimo.",
+        "tracking_hdr":  "Mahitio: {grade} | {term}\n",
+        "suggestion":    "{suggestions}\nUnaweza pia kuuliza swali lolote la CBE!",
+        "senior_perf":   "Mahitio: {grade} | {term}\n{suggestions}",
         "no_pathway":    "Ithoma mbere. Cookia START.",
-        "done":          "Ithomo niikuura.\nCookia CAREERS kana START gutomia.",
+        "done":          "Niikuura. Cookia CAREERS kana uiguithia swali la CBE!",
+        "career_saved":  "Murimo waku niikuura!",
+        "invalid_career":"Ti wegwaru. Cookia nambari kutoka orodha ya mirimo.",
     },
 }
 
 # =============================================================
 #  SMS DB HELPERS
 # =============================================================
-# Column order: phone(0) lang(1) level(2) grade(3) term(4)
-#               math(5) science(6) social(7) creative(8)
-#               technical(9) pathway(10) state(11)
+# Columns: phone(0) lang(1) level(2) grade(3) term(4) pathway(5)
+#          math(6) science(7) social(8) creative(9) technical(10)
+#          career_interest(11) state(12)
 
 SMS_ALLOWED = {
-    "lang", "level", "grade", "term", "math", "science",
-    "social", "creative", "technical", "pathway", "state"
+    "lang","level","grade","term","pathway",
+    "math","science","social","creative","technical",
+    "career_interest","state"
 }
 
 def sms_save(phone, field, value):
@@ -307,21 +626,18 @@ def sms_save(phone, field, value):
 def sms_get(phone):
     conn = get_connection(); cur = conn.cursor()
     cur.execute("""
-        SELECT phone, lang, level, grade, term,
+        SELECT phone, lang, level, grade, term, pathway,
                math, science, social, creative, technical,
-               pathway, state
+               career_interest, state
         FROM students WHERE phone=%s
     """, (phone,))
     s = cur.fetchone(); cur.close(); conn.close()
     return s
-    # phone(0) lang(1) level(2) grade(3) term(4)
-    # math(5) science(6) social(7) creative(8) technical(9)
-    # pathway(10) state(11)
 
 def sms_calculate_pathway(phone):
     s = sms_get(phone)
     if not s: return None
-    pathway = calculate_pathway_from_scores(s[5], s[6], s[7], s[8], s[9])
+    pathway = calculate_pathway_from_scores(s[6], s[7], s[8], s[9], s[10])
     sms_save(phone, "pathway", pathway)
     return pathway
 
@@ -345,44 +661,44 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
 
     student = sms_get(phone)
 
-    # ── Always start with language selection ─────────────────────
-    if not student or text_upper == "START":
+    # ── Always restart fresh on START ────────────────────────────
+    if text_upper == "START" or not student:
         sms_save(phone, "state", "LANG")
         await send_reply(phone, LANG_SELECT_MSG)
         return ""
 
     lang  = student[1] if student[1] in SMS_MENU else "en"
-    state = student[11]
+    state = student[12]
     M     = SMS_MENU[lang]
 
-    # ── MORE command — full career list with labour market data ──
-    if text_upper == "MORE":
-        pathway = student[10] if student else None
-        grade   = student[3]  if student else ""
-        if not pathway:
-            pathway = sms_calculate_pathway(phone)
-        if pathway:
-            full_careers = format_senior_all_careers_sms(pathway, lang)
-            await send_reply(phone, full_careers)
-        else:
-            await send_reply(phone, M["no_pathway"])
+    # ── AI Question — anything that looks like a question ────────
+    if is_cbe_question(text_clean) and state not in ("LANG","LEVEL","JSS_GRADE",
+       "SENIOR_GRADE","TERM","SENIOR_PATHWAY","S_SUBJ1","S_SUBJ2","S_SUBJ3",
+       "S_SUBJ4","S_SUBJ5","MATH","SCIENCE","SOCIAL","CREATIVE","TECH"):
+        answer = await ask_gemini(phone, text_clean)
+        await send_reply(phone, answer)
         return ""
 
-    # ── CAREERS command ──────────────────────────────────────────
-    if text_upper == "CAREERS":
-        pathway = student[10]
+    # ── MORE command — full career list ──────────────────────────
+    if text_upper == "MORE":
+        pathway = student[5]
         grade   = student[3] or ""
-        if not pathway:
-            pathway = sms_calculate_pathway(phone)
-        if not pathway:
-            await send_reply(phone, M["no_pathway"]); return ""
-        if pathway == "STEM":          await send_reply(phone, M["careers_stem"])
-        elif pathway == "Social Sciences": await send_reply(phone, M["careers_soc"])
-        else:                          await send_reply(phone, M["careers_arts"])
+        if not pathway: await send_reply(phone, M["no_pathway"]); return ""
+        await send_reply(phone, get_all_careers_sms(pathway, lang))
+        sms_save(phone, "state", "CAREER_SELECT_ALL")
+        return ""
+
+    # ── CAREERS command ───────────────────────────────────────────
+    if text_upper == "CAREERS":
+        pathway = student[5]
+        grade   = student[3] or ""
+        if not pathway: await send_reply(phone, M["no_pathway"]); return ""
+        await send_reply(phone, get_career_list_sms(pathway, lang, grade))
+        sms_save(phone, "state", "CAREER_SELECT")
         return ""
 
     try:
-        # ── Language selection ───────────────────────────────────
+        # ── Language selection ────────────────────────────────────
         if state == "LANG":
             chosen = LANG_MAP.get(text_clean)
             if not chosen:
@@ -391,7 +707,7 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
             sms_save(phone, "state", "LEVEL")
             await send_reply(phone, SMS_MENU[chosen]["welcome"])
 
-        # ── Level selection ──────────────────────────────────────
+        # ── Level ─────────────────────────────────────────────────
         elif state == "LEVEL":
             if text_clean == "1":
                 sms_save(phone, "level", "JSS")
@@ -404,105 +720,163 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
             else:
                 await send_reply(phone, M["level_err"])
 
-        # ── JSS Grade (7, 8, 9) ──────────────────────────────────
+        # ── JSS Grade ─────────────────────────────────────────────
         elif state == "JSS_GRADE":
             g = JSS_GRADES.get(text_clean)
             if not g:
-                await send_reply(phone, M["grade_err"] + "\n" + M["jss_grade"]); return ""
+                await send_reply(phone, M["grade_err"]+"\n"+M["jss_grade"]); return ""
             sms_save(phone, "grade", g)
             sms_save(phone, "state", "TERM")
             await send_reply(phone, M["term"])
 
-        # ── Senior Grade (10, 11, 12) ────────────────────────────
+        # ── Senior Grade ──────────────────────────────────────────
         elif state == "SENIOR_GRADE":
             g = SENIOR_GRADES.get(text_clean)
             if not g:
-                await send_reply(phone, M["grade_err"] + "\n" + M["senior_grade"]); return ""
+                await send_reply(phone, M["grade_err"]+"\n"+M["senior_grade"]); return ""
             sms_save(phone, "grade", g)
             sms_save(phone, "state", "TERM")
             await send_reply(phone, M["term"])
 
-        # ── Term selection ───────────────────────────────────────
+        # ── Term ──────────────────────────────────────────────────
         elif state == "TERM":
             t = TERMS.get(text_clean)
             if not t:
-                await send_reply(phone, M["term_err"] + "\n" + M["term"]); return ""
+                await send_reply(phone, M["term_err"]+"\n"+M["term"]); return ""
             sms_save(phone, "term", t)
-            sms_save(phone, "state", "MATH")
-            await send_reply(phone, M["math"])
+            # Route: Senior needs pathway first; JSS goes straight to subjects
+            if student[2] == "Senior":
+                sms_save(phone, "state", "SENIOR_PATHWAY")
+                await send_reply(phone, M["senior_pathway"])
+            else:
+                sms_save(phone, "state", "MATH")
+                await send_reply(phone, M["math"] if hasattr(M, "get") else
+                    f"Rate Math:\n{RATING_OPTIONS_SMS}")
 
-        # ── Subject ratings ──────────────────────────────────────
+        # ── Senior Pathway Selection ──────────────────────────────
+        elif state == "SENIOR_PATHWAY":
+            chosen = PATHWAYS.get(text_clean)
+            if not chosen:
+                await send_reply(phone, M["pathway_err"]+"\n"+M["senior_pathway"]); return ""
+            sms_save(phone, "pathway", chosen)
+            subjects = get_senior_subjects(chosen)
+            sms_save(phone, "state", "S_SUBJ1")
+            field, label = subjects[0]
+            await send_reply(phone, f"Rate {label}:\n{RATING_OPTIONS_SMS}")
+
+        # ── Senior Subject Ratings (S_SUBJ1 to S_SUBJ5) ──────────
+        elif state in SENIOR_STATES:
+            idx      = SENIOR_STATES.index(state)
+            pathway  = student[5]
+            subjects = get_senior_subjects(pathway)
+            score    = RATING_MAP.get(text_clean)
+            if not score:
+                field, label = subjects[idx]
+                await send_reply(phone, f"Invalid.\nRate {label}:\n{RATING_OPTIONS_SMS}"); return ""
+            field, label = subjects[idx]
+            sms_save(phone, field, score)
+
+            if idx < 4:
+                # Move to next subject
+                next_field, next_label = subjects[idx + 1]
+                sms_save(phone, "state", SENIOR_STATES[idx + 1])
+                await send_reply(phone, f"Rate {next_label}:\n{RATING_OPTIONS_SMS}")
+            else:
+                # All 5 subjects done — show performance + careers
+                sms_save(phone, "state", "CAREER_SELECT")
+                s = sms_get(phone)
+                grade   = s[3] or ""
+                term    = s[4] or ""
+                suggestions = get_improvement_suggestions(s[6],s[7],s[8],s[9],s[10],lang)
+                # Message 1: performance
+                await send_reply(phone, M["senior_perf"].format(
+                    grade=grade, term=term, suggestions=suggestions))
+                # Message 2: career list with market ratings
+                await send_reply(phone, get_career_list_sms(pathway, lang, grade))
+
+        # ── JSS Subject Ratings (MATH→SCIENCE→SOCIAL→CREATIVE→TECH)
         elif state == "MATH":
             score = RATING_MAP.get(text_clean)
             if not score:
-                await send_reply(phone, f"{M['invalid']}\n{M['math']}"); return ""
+                await send_reply(phone, f"Invalid.\nRate Math:\n{RATING_OPTIONS_SMS}"); return ""
             sms_save(phone, "math", score)
             sms_save(phone, "state", "SCIENCE")
-            await send_reply(phone, M["science"])
+            await send_reply(phone, f"Rate Science:\n{RATING_OPTIONS_SMS}")
 
         elif state == "SCIENCE":
             score = RATING_MAP.get(text_clean)
             if not score:
-                await send_reply(phone, f"{M['invalid']}\n{M['science']}"); return ""
+                await send_reply(phone, f"Invalid.\nRate Science:\n{RATING_OPTIONS_SMS}"); return ""
             sms_save(phone, "science", score)
             sms_save(phone, "state", "SOCIAL")
-            await send_reply(phone, M["social"])
+            await send_reply(phone, f"Rate Social Studies:\n{RATING_OPTIONS_SMS}")
 
         elif state == "SOCIAL":
             score = RATING_MAP.get(text_clean)
             if not score:
-                await send_reply(phone, f"{M['invalid']}\n{M['social']}"); return ""
+                await send_reply(phone, f"Invalid.\nRate Social Studies:\n{RATING_OPTIONS_SMS}"); return ""
             sms_save(phone, "social", score)
             sms_save(phone, "state", "CREATIVE")
-            await send_reply(phone, M["creative"])
+            await send_reply(phone, f"Rate Creative Arts:\n{RATING_OPTIONS_SMS}")
 
         elif state == "CREATIVE":
             score = RATING_MAP.get(text_clean)
             if not score:
-                await send_reply(phone, f"{M['invalid']}\n{M['creative']}"); return ""
+                await send_reply(phone, f"Invalid.\nRate Creative Arts:\n{RATING_OPTIONS_SMS}"); return ""
             sms_save(phone, "creative", score)
             sms_save(phone, "state", "TECH")
-            await send_reply(phone, M["tech"])
+            await send_reply(phone, f"Rate Technical Skills:\n{RATING_OPTIONS_SMS}")
 
         elif state == "TECH":
             score = RATING_MAP.get(text_clean)
             if not score:
-                await send_reply(phone, f"{M['invalid']}\n{M['tech']}"); return ""
+                await send_reply(phone, f"Invalid.\nRate Technical Skills:\n{RATING_OPTIONS_SMS}"); return ""
             sms_save(phone, "technical", score)
-            sms_save(phone, "state", "DONE")
-
-            # Reload student with all scores
             s     = sms_get(phone)
             grade = s[3] or ""
             term  = s[4] or ""
-            math, science, social, creative, technical = s[5], s[6], s[7], s[8], s[9]
 
-            # ── Grade 9: Predict pathway ─────────────────────────
             if grade == "Grade 9":
-                pathway = sms_calculate_pathway(phone)
+                pathway = calculate_pathway_from_scores(s[6],s[7],s[8],s[9],s[10])
+                sms_save(phone, "pathway", pathway)
+                sms_save(phone, "state", "DONE")
                 await send_reply(phone, M["pathway_msg"].format(pathway=pathway))
-
-            # ── Grade 7 & 8: Track + suggest improvements ────────
-            elif grade in ("Grade 7", "Grade 8"):
-                suggestions = get_improvement_suggestions(
-                    math, science, social, creative, technical, lang
-                )
-                header = M["tracking_hdr"].format(grade=grade, term=term)
-                await send_reply(phone, header + M["suggestion"].format(suggestions=suggestions))
-
-            # ── Senior Grades 10-12: Track + pathway careers ─────
             else:
-                # 1. Performance suggestions
-                suggestions = get_improvement_suggestions(
-                    math, science, social, creative, technical, lang
-                )
-                await send_reply(phone, M["senior_msg"].format(
-                    grade=grade, term=term, suggestions=suggestions
-                ))
-                # 2. Career options with Kenya labour market ratings
-                pathway = student[10] or sms_calculate_pathway(phone)
-                career_msg = format_senior_careers_sms(pathway, grade, lang)
-                await send_reply(phone, career_msg)
+                suggestions = get_improvement_suggestions(s[6],s[7],s[8],s[9],s[10],lang)
+                sms_save(phone, "state", "DONE")
+                await send_reply(phone, M["tracking_hdr"].format(grade=grade,term=term)
+                                 + M["suggestion"].format(suggestions=suggestions))
+
+        # ── Career Selection (top 5 list) ─────────────────────────
+        elif state == "CAREER_SELECT":
+            pathway = student[5]
+            if not pathway: await send_reply(phone, M["no_pathway"]); return ""
+            if text_clean.isdigit() and 1 <= int(text_clean) <= 5:
+                idx    = int(text_clean) - 1
+                career = SENIOR_CAREERS[pathway][idx][0]
+                sms_save(phone, "career_interest", career)
+                sms_save(phone, "state", "DONE")
+                await send_reply(phone, M["career_saved"])
+                await send_reply(phone, get_career_detail_sms(pathway, idx, lang))
+            elif text_upper == "MORE":
+                await send_reply(phone, get_all_careers_sms(pathway, lang))
+                sms_save(phone, "state", "CAREER_SELECT_ALL")
+            else:
+                await send_reply(phone, M["invalid_career"])
+
+        # ── Career Selection (all 10 list) ────────────────────────
+        elif state == "CAREER_SELECT_ALL":
+            pathway = student[5]
+            if not pathway: await send_reply(phone, M["no_pathway"]); return ""
+            if text_clean.isdigit() and 1 <= int(text_clean) <= 10:
+                idx    = int(text_clean) - 1
+                career = SENIOR_CAREERS[pathway][idx][0]
+                sms_save(phone, "career_interest", career)
+                sms_save(phone, "state", "DONE")
+                await send_reply(phone, M["career_saved"])
+                await send_reply(phone, get_career_detail_sms(pathway, idx, lang))
+            else:
+                await send_reply(phone, M["invalid_career"])
 
         else:
             await send_reply(phone, M["done"])
@@ -517,13 +891,14 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
 # =============================================================
 #  USSD DB HELPERS
 # =============================================================
-# Column order: phone(0) lang(1) level(2) grade(3) term(4)
-#               math(5) science(6) social(7) creative(8)
-#               technical(9) pathway(10) state(11)
+# Columns: phone(0) lang(1) level(2) grade(3) term(4) pathway(5)
+#          math(6) science(7) social(8) creative(9) technical(10)
+#          career_interest(11) state(12)
 
 USSD_ALLOWED = {
-    "lang", "level", "grade", "term", "math", "science",
-    "social", "creative", "technical", "pathway", "state"
+    "lang","level","grade","term","pathway",
+    "math","science","social","creative","technical",
+    "career_interest","state"
 }
 
 def ussd_save(phone, field, value):
@@ -537,21 +912,18 @@ def ussd_save(phone, field, value):
 def ussd_get(phone):
     conn = get_connection(); cur = conn.cursor()
     cur.execute("""
-        SELECT phone, lang, level, grade, term,
+        SELECT phone, lang, level, grade, term, pathway,
                math, science, social, creative, technical,
-               pathway, state
+               career_interest, state
         FROM ussd_students WHERE phone=%s
     """, (phone,))
     s = cur.fetchone(); cur.close(); conn.close()
     return s
-    # phone(0) lang(1) level(2) grade(3) term(4)
-    # math(5) science(6) social(7) creative(8) technical(9)
-    # pathway(10) state(11)
 
 def ussd_calculate_pathway(phone):
     s = ussd_get(phone)
     if not s: return None
-    pathway = calculate_pathway_from_scores(s[5], s[6], s[7], s[8], s[9])
+    pathway = calculate_pathway_from_scores(s[6],s[7],s[8],s[9],s[10])
     ussd_save(phone, "pathway", pathway)
     return pathway
 
@@ -559,17 +931,17 @@ def ussd_reset(phone):
     conn = get_connection(); cur = conn.cursor()
     cur.execute("""
         UPDATE ussd_students
-        SET lang=NULL, level=NULL, grade=NULL, term=NULL,
+        SET lang=NULL, level=NULL, grade=NULL, term=NULL, pathway=NULL,
             math=NULL, science=NULL, social=NULL, creative=NULL,
-            technical=NULL, pathway=NULL, state='LANG'
+            technical=NULL, career_interest=NULL, state='LANG'
         WHERE phone=%s
     """, (phone,))
     conn.commit(); cur.close(); conn.close()
 
 def con(text):  return f"CON {text}"
 def end(text):  return f"END {text}"
-def rating_screen(subject):  return con(f"Rate {subject}:\n{RATING_OPTIONS_USSD}")
-def invalid_rating(subject): return con(f"Invalid. Rate {subject}:\n{RATING_OPTIONS_USSD}")
+def rating_screen(subject): return con(f"Rate {subject}:\n{RATING_OPTIONS_USSD}")
+def invalid_rating(s):      return con(f"Invalid.\nRate {s}:\n{RATING_OPTIONS_USSD}")
 
 # =============================================================
 #  USSD WEBHOOK
@@ -585,44 +957,31 @@ async def ussd_callback(
     phone = phoneNumber
     steps = [s.strip() for s in text.split("*")] if text else []
     step  = steps[-1] if steps else ""
-    print(f"[USSD] *384*59423# | session={sessionId} | phone={phone[:7]}**** | steps={steps}")
+    print(f"[USSD] session={sessionId} phone={phone[:7]}**** steps={steps}")
 
     student = ussd_get(phone)
 
-    # ── Always start with English language selection ─────────────
     if not text or not student:
         ussd_save(phone, "state", "LANG")
-        return con(
-            "Welcome to EduTena CBE\n"
-            "Select Language:\n"
-            "1. English\n"
-            "2. Swahili\n"
-            "3. Luhya\n"
-            "4. Kikuyu"
-        )
+        return con("Welcome to EduTena CBE\nSelect Language:\n1. English\n2. Swahili\n3. Luhya\n4. Kikuyu")
 
-    state = student[11]
-    lang  = student[1] if student[1] in SMS_MENU else "en"
+    state   = student[12]
+    lang    = student[1] if student[1] in SMS_MENU else "en"
+    pathway = student[5]
 
     try:
-        # ── Language selection ───────────────────────────────────
         if state == "LANG":
             chosen = LANG_MAP.get(step)
             if not chosen:
-                return con("Invalid.\nSelect Language:\n1. English\n2. Swahili\n3. Luhya\n4. Kikuyu")
+                return con("Invalid.\n1. English\n2. Swahili\n3. Luhya\n4. Kikuyu")
             ussd_save(phone, "lang", chosen)
             ussd_save(phone, "state", "LEVEL")
-            lang = chosen
-            if lang == "en":
-                return con("EduTena CBE\nSelect Level:\n1. JSS (Grade 7-9)\n2. Senior (Grade 10-12)")
-            elif lang == "sw":
-                return con("EduTena CBE\nChagua Kiwango:\n1. JSS (Darasa 7-9)\n2. Sekondari (Darasa 10-12)")
-            elif lang == "lh":
-                return con("EduTena CBE\nSena Engufu:\n1. JSS (Okhufunda 7-9)\n2. Sekondari (Okhufunda 10-12)")
-            else:
-                return con("EduTena CBE\nThura Kiwango:\n1. JSS (Kiwango 7-9)\n2. Sekondari (Kiwango 10-12)")
+            labels = {"en":"EduTena CBE\n1. JSS (Gr 7-9)\n2. Senior (Gr 10-12)",
+                      "sw":"EduTena CBE\n1. JSS (Darasa 7-9)\n2. Sekondari (Darasa 10-12)",
+                      "lh":"EduTena CBE\n1. JSS (Okhufunda 7-9)\n2. Sekondari (Okhufunda 10-12)",
+                      "ki":"EduTena CBE\n1. JSS (Kiwango 7-9)\n2. Sekondari (Kiwango 10-12)"}
+            return con(labels.get(chosen, labels["en"]))
 
-        # ── Level selection ──────────────────────────────────────
         elif state == "LEVEL":
             if step == "1":
                 ussd_save(phone, "level", "JSS")
@@ -635,166 +994,137 @@ async def ussd_callback(
             else:
                 return con("Invalid.\n1. JSS (Grade 7-9)\n2. Senior (Grade 10-12)")
 
-        # ── JSS Grade ────────────────────────────────────────────
         elif state == "JSS_GRADE":
             g = JSS_GRADES.get(step)
-            if not g:
-                return con("Invalid.\n1. Grade 7\n2. Grade 8\n3. Grade 9")
+            if not g: return con("Invalid.\n1. Grade 7\n2. Grade 8\n3. Grade 9")
             ussd_save(phone, "grade", g)
             ussd_save(phone, "state", "TERM")
             return con("Select Term:\n1. Term 1\n2. Term 2\n3. Term 3")
 
-        # ── Senior Grade ─────────────────────────────────────────
         elif state == "SENIOR_GRADE":
             g = SENIOR_GRADES.get(step)
-            if not g:
-                return con("Invalid.\n1. Grade 10\n2. Grade 11\n3. Grade 12")
+            if not g: return con("Invalid.\n1. Grade 10\n2. Grade 11\n3. Grade 12")
             ussd_save(phone, "grade", g)
             ussd_save(phone, "state", "TERM")
             return con("Select Term:\n1. Term 1\n2. Term 2\n3. Term 3")
 
-        # ── Term selection ───────────────────────────────────────
         elif state == "TERM":
             t = TERMS.get(step)
-            if not t:
-                return con("Invalid.\n1. Term 1\n2. Term 2\n3. Term 3")
+            if not t: return con("Invalid.\n1. Term 1\n2. Term 2\n3. Term 3")
             ussd_save(phone, "term", t)
-            ussd_save(phone, "state", "MATH")
-            return rating_screen("Math")
+            if student[2] == "Senior":
+                ussd_save(phone, "state", "SENIOR_PATHWAY")
+                return con("Select Senior Pathway:\n1. STEM\n2. Social Sciences\n3. Arts & Sports")
+            else:
+                ussd_save(phone, "state", "MATH")
+                return rating_screen("Math")
 
-        # ── Subject ratings ──────────────────────────────────────
+        elif state == "SENIOR_PATHWAY":
+            chosen = PATHWAYS.get(step)
+            if not chosen:
+                return con("Invalid.\n1. STEM\n2. Social Sciences\n3. Arts & Sports")
+            ussd_save(phone, "pathway", chosen)
+            subjects = get_senior_subjects(chosen)
+            ussd_save(phone, "state", "S_SUBJ1")
+            _, label = subjects[0]
+            return rating_screen(label)
+
+        elif state in SENIOR_STATES:
+            idx      = SENIOR_STATES.index(state)
+            subjects = get_senior_subjects(student[5])
+            score    = RATING_MAP.get(step)
+            if not score:
+                _, label = subjects[idx]
+                return invalid_rating(label)
+            field, _ = subjects[idx]
+            ussd_save(phone, field, score)
+            if idx < 4:
+                _, next_label = subjects[idx + 1]
+                ussd_save(phone, "state", SENIOR_STATES[idx + 1])
+                return rating_screen(next_label)
+            else:
+                # Done — show careers with demand
+                pathway = student[5]
+                ussd_save(phone, "state", "USSD_CAREER_SELECT")
+                career_lines = get_career_ussd_list(pathway)
+                return con(career_lines)
+
         elif state == "MATH":
             score = RATING_MAP.get(step)
             if not score: return invalid_rating("Math")
-            ussd_save(phone, "math", score)
-            ussd_save(phone, "state", "SCIENCE")
+            ussd_save(phone, "math", score); ussd_save(phone, "state", "SCIENCE")
             return rating_screen("Science")
 
         elif state == "SCIENCE":
             score = RATING_MAP.get(step)
             if not score: return invalid_rating("Science")
-            ussd_save(phone, "science", score)
-            ussd_save(phone, "state", "SOCIAL")
+            ussd_save(phone, "science", score); ussd_save(phone, "state", "SOCIAL")
             return rating_screen("Social Studies")
 
         elif state == "SOCIAL":
             score = RATING_MAP.get(step)
             if not score: return invalid_rating("Social Studies")
-            ussd_save(phone, "social", score)
-            ussd_save(phone, "state", "CREATIVE")
+            ussd_save(phone, "social", score); ussd_save(phone, "state", "CREATIVE")
             return rating_screen("Creative Arts")
 
         elif state == "CREATIVE":
             score = RATING_MAP.get(step)
             if not score: return invalid_rating("Creative Arts")
-            ussd_save(phone, "creative", score)
-            ussd_save(phone, "state", "TECH")
+            ussd_save(phone, "creative", score); ussd_save(phone, "state", "TECH")
             return rating_screen("Technical Skills")
 
         elif state == "TECH":
             score = RATING_MAP.get(step)
             if not score: return invalid_rating("Technical Skills")
             ussd_save(phone, "technical", score)
-
             s     = ussd_get(phone)
             grade = s[3] or ""
             term  = s[4] or ""
-            math, science, social, creative, technical = s[5], s[6], s[7], s[8], s[9]
-
-            # ── Grade 9: Predict pathway ─────────────────────────
             if grade == "Grade 9":
-                pathway = ussd_calculate_pathway(phone)
+                pathway = calculate_pathway_from_scores(s[6],s[7],s[8],s[9],s[10])
+                ussd_save(phone, "pathway", pathway)
                 ussd_save(phone, "state", "RESULT")
-                return con(
-                    f"Predicted Pathway:\n{pathway}\n\n"
-                    "1. View Careers\n"
-                    "2. Restart\n"
-                    "3. Exit"
-                )
-
-            # ── Grade 7 & 8: Performance tracking ────────────────
-            elif grade in ("Grade 7", "Grade 8"):
-                suggestions = get_improvement_suggestions(math, science, social, creative, technical, lang)
+                return con(f"Predicted Pathway:\n{pathway}\n\n1. View Careers\n2. Restart\n3. Exit")
+            else:
+                suggestions = get_improvement_suggestions(s[6],s[7],s[8],s[9],s[10],lang)
+                short = suggestions[:90]+"..." if len(suggestions)>90 else suggestions
                 ussd_save(phone, "state", "DONE")
-                # Trim for USSD screen
-                short = suggestions[:100] + "..." if len(suggestions) > 100 else suggestions
-                return con(
-                    f"{grade} | {term}\n"
-                    f"{short}\n\n"
-                    "1. Restart\n"
-                    "2. Exit"
-                )
+                return con(f"{grade}|{term}\n{short}\n\n1. Restart\n2. Exit")
 
-            # ── Senior: Performance tracking + career demand ──────
+        elif state == "USSD_CAREER_SELECT":
+            pathway = student[5]
+            if step.isdigit() and 1 <= int(step) <= 6:
+                idx = int(step) - 1
+                career = SENIOR_CAREERS[pathway][idx][0]
+                ussd_save(phone, "career_interest", career)
+                ussd_save(phone, "state", "DONE")
+                _, _, salary, trend, unis, subjects = SENIOR_CAREERS[pathway][idx]
+                short_unis = unis[:40]+"..." if len(unis)>40 else unis
+                return end(f"Career: {career}\nColleges: {short_unis}\nFocus: {subjects[:40]}\nSaved! SMS START for full details.")
+            elif step == "7":
+                # Show all careers
+                career_lines = get_career_ussd_list(pathway)
+                return con(career_lines.replace("6.","6.").replace("7. More careers",""))
             else:
-                suggestions = get_improvement_suggestions(math, science, social, creative, technical, lang)
-                pathway     = ussd_calculate_pathway(phone)
-                ussd_save(phone, "state", "SENIOR_CAREERS")
-                short = suggestions[:80] + "..." if len(suggestions) > 80 else suggestions
-                return con(
-                    f"{grade} | {term}\n"
-                    f"{short}\n\n"
-                    "1. View Career Demand\n"
-                    "2. Restart\n"
-                    "3. Exit"
-                )
+                return con(get_career_ussd_list(pathway))
 
-        # ── RESULT menu (Grade 9 pathway) ────────────────────────
         elif state == "RESULT":
-            pathway = student[10] or ussd_calculate_pathway(phone)
+            pathway = student[5] or ussd_calculate_pathway(phone)
             if step == "1":
-                ussd_save(phone, "state", "CAREERS")
-                if pathway == "STEM":
-                    return con("STEM Careers:\n- Engineering\n- Data Science\n- Medicine\n- Architecture\n- Pharmacy\n\n0. Back")
-                elif pathway == "Social Sciences":
-                    return con("Social Sciences:\n- Law\n- Psychology\n- Economics\n- Education\n- Journalism\n\n0. Back")
-                else:
-                    return con("Arts & Sports:\n- Design\n- Music\n- Sports Science\n- Film & Media\n- Fashion\n\n0. Back")
-            elif step == "2":
-                ussd_reset(phone)
-                return con("Welcome to EduTena CBE\nSelect Language:\n1. English\n2. Swahili\n3. Luhya\n4. Kikuyu")
-            elif step == "3":
-                return end("Thank you for using EduTena CBE.\nGood luck!")
-            else:
-                return con(f"Pathway: {pathway}\n\n1. View Careers\n2. Restart\n3. Exit")
-
-        # ── SENIOR_CAREERS menu — career demand per pathway ────────
-        elif state == "SENIOR_CAREERS":
-            pathway = student[10] or ussd_calculate_pathway(phone)
-            if step == "1":
-                ussd_save(phone, "state", "SENIOR_CAREERS_LIST")
-                career_lines = format_senior_careers_ussd(pathway)
-                return con(career_lines)
+                ussd_save(phone, "state", "USSD_CAREER_SELECT")
+                return con(get_career_ussd_list(pathway))
             elif step == "2":
                 ussd_reset(phone)
                 return con("Welcome to EduTena CBE\nSelect Language:\n1. English\n2. Swahili\n3. Luhya\n4. Kikuyu")
             else:
-                return end("Thank you for using EduTena CBE.\nGood luck!")
+                return end("Thank you for using EduTena CBE. Good luck!")
 
-        # ── SENIOR_CAREERS_LIST — showing career demand list ─────────
-        elif state == "SENIOR_CAREERS_LIST":
-            if step == "0":
-                ussd_save(phone, "state", "SENIOR_CAREERS")
-                return con("1. View Career Demand\n2. Restart\n3. Exit")
-            else:
-                return end("Thank you!\nSend START via SMS for full career details.")
-
-        # ── DONE menu (Grade 7, 8, Senior) ───────────────────────
         elif state == "DONE":
             if step == "1":
                 ussd_reset(phone)
                 return con("Welcome to EduTena CBE\nSelect Language:\n1. English\n2. Swahili\n3. Luhya\n4. Kikuyu")
             else:
-                return end("Thank you for using EduTena CBE.\nGood luck!")
-
-        # ── CAREERS ──────────────────────────────────────────────
-        elif state == "CAREERS":
-            if step == "0":
-                pathway = student[10]
-                ussd_save(phone, "state", "RESULT")
-                return con(f"Pathway: {pathway}\n\n1. View Careers\n2. Restart\n3. Exit")
-            else:
-                return end("Thank you for using EduTena CBE.\nGood luck!")
+                return end("Thank you for using EduTena CBE. Good luck!")
 
         else:
             ussd_reset(phone)
@@ -803,128 +1133,3 @@ async def ussd_callback(
     except Exception as e:
         print(f"[USSD] Error: {e}")
         return end("Something went wrong. Please dial again.")
-
-
-# =============================================================
-#  KENYA LABOUR MARKET DATA 2025
-#  Source: Kenya Labour Market Information System (KLMIS),
-#          MyJobMag 2025, By Appointment Africa 2025
-#
-#  Demand rating scale:
-#  ⭐⭐⭐⭐⭐  = Very High Demand  (5★)
-#  ⭐⭐⭐⭐    = High Demand       (4★)
-#  ⭐⭐⭐      = Moderate Demand   (3★)
-#  ⭐⭐        = Lower Demand      (2★)
-# =============================================================
-
-SENIOR_CAREERS = {
-    "STEM": [
-        # career, demand stars, avg salary KES/month, growth trend
-        ("Software Engineer",        "5★", "80,000-200,000",  "↑ Growing fast — Silicon Savannah"),
-        ("Data Analyst/Scientist",   "5★", "70,000-180,000",  "↑ Highest demand in tech 2025"),
-        ("Cybersecurity Specialist", "5★", "90,000-250,000",  "↑ Critical shortage nationwide"),
-        ("Renewable Energy Engineer","4★", "60,000-150,000",  "↑ Kenya green energy boom"),
-        ("Pharmacist",               "4★", "50,000-120,000",  "↑ Healthcare sector growing"),
-        ("Civil/Structural Engineer","4★", "55,000-130,000",  "→ Steady, housing demand high"),
-        ("Medical Doctor",           "4★", "80,000-300,000",  "↑ Public & private sector need"),
-        ("ICT Support Specialist",   "3★", "30,000-70,000",   "→ Steady demand countrywide"),
-        ("Laboratory Technician",    "3★", "25,000-55,000",   "→ Moderate, mostly public sector"),
-        ("Architect",                "3★", "50,000-120,000",  "→ Urban development projects"),
-    ],
-    "Social Sciences": [
-        ("Accountant/Auditor",       "5★", "50,000-150,000",  "↑ Most advertised job in Kenya 2025"),
-        ("Finance Manager",          "5★", "80,000-200,000",  "↑ Fintech growth driving demand"),
-        ("Lawyer/Advocate",          "4★", "60,000-250,000",  "↑ Legal services expanding"),
-        ("Digital Marketer",         "4★", "35,000-120,000",  "↑ 17% of all job postings 2025"),
-        ("Sales Executive",          "4★", "30,000-100,000",  "↑ Top 3 most hired role Kenya"),
-        ("Human Resource Manager",   "3★", "45,000-120,000",  "→ Steady across all sectors"),
-        ("Economist",                "3★", "50,000-130,000",  "→ Government & research orgs"),
-        ("Teacher/Educator",         "3★", "25,000-60,000",   "→ High need, CBC transition"),
-        ("Journalist/Media",         "2★", "20,000-60,000",   "↓ Print declining, digital rising"),
-        ("Psychologist/Counsellor",  "3★", "30,000-80,000",   "↑ Mental health awareness growing"),
-    ],
-    "Arts & Sports Science": [
-        ("Graphic Designer/UI-UX",   "4★", "35,000-120,000",  "↑ Digital economy driving demand"),
-        ("Film & Content Creator",   "4★", "20,000-150,000",  "↑ YouTube/social media economy"),
-        ("Sports Coach/Manager",     "3★", "25,000-80,000",   "→ Growing with sports academies"),
-        ("Fashion Designer",         "2★", "15,000-80,000",   "→ Niche but growing locally"),
-        ("Musician/Performer",       "2★", "Variable",        "→ Competitive, digital revenue"),
-        ("Interior Designer",        "3★", "30,000-100,000",  "↑ Urban housing boom"),
-        ("Physiotherapist",          "3★", "35,000-90,000",   "↑ Sports & healthcare sector"),
-        ("Tourism/Hospitality Mgr",  "3★", "30,000-100,000",  "↑ Post-COVID recovery strong"),
-        ("Beauty & Wellness Therapist","3★","20,000-70,000",  "↑ TVET boom, rising demand"),
-        ("Community Development",    "2★", "25,000-60,000",   "→ NGO-driven employment"),
-    ]
-}
-
-def format_senior_careers_sms(pathway: str, grade: str, lang: str) -> str:
-    """
-    Format career options with Kenya labour market ratings for SMS.
-    Shows top 5 careers to fit SMS length limits.
-    """
-    careers = SENIOR_CAREERS.get(pathway, SENIOR_CAREERS["STEM"])
-
-    headers = {
-        "en": f"Career Options | {grade}\nKenya Labour Market 2025\n",
-        "sw": f"Chaguzi za Kazi | {grade}\nSoko la Kazi Kenya 2025\n",
-        "lh": f"Emilimo | {grade}\nSoko ya Kazi Kenya 2025\n",
-        "ki": f"Mirimo | {grade}\nSoko ria Kazi Kenya 2025\n",
-    }
-    demand_labels = {
-        "en": "Demand", "sw": "Mahitaji", "lh": "Haja", "ki": "Hitaji"
-    }
-    salary_labels = {
-        "en": "Salary/mo", "sw": "Mshahara/mwezi", "lh": "Mishahara", "ki": "Mshahara"
-    }
-
-    msg = headers.get(lang, headers["en"])
-    # Show top 5 by demand (already sorted highest first)
-    for name, stars, salary, trend in careers[:5]:
-        msg += f"\n{name}\n{demand_labels.get(lang,'Demand')}: {stars}\n{salary_labels.get(lang,'Salary')}: KES {salary}\n{trend}\n"
-
-    footer = {
-        "en": "\nReply MORE for all careers or START to reassess.",
-        "sw": "\nJibu MORE kwa kazi zote au START kuanza upya.",
-        "lh": "\nJibu MORE kwa emilimo yote kamba START okhuanza.",
-        "ki": "\nCookia MORE mirimo yothe kana START gutomia.",
-    }
-    msg += footer.get(lang, footer["en"])
-    return msg
-
-def format_senior_careers_ussd(pathway: str) -> str:
-    """
-    Format career options for USSD screen — compact version.
-    Shows top 6 careers with demand rating only (no salary — too long).
-    """
-    careers = SENIOR_CAREERS.get(pathway, SENIOR_CAREERS["STEM"])
-    lines = "Top Careers | Kenya 2025\n"
-    for name, stars, salary, trend in careers[:6]:
-        # Shorten name to fit USSD screen
-        short_name = name[:18] if len(name) > 18 else name
-        lines += f"{short_name}: {stars}\n"
-    lines += "\n1. Full Details (SMS)\n2. Restart\n3. Exit"
-    return lines
-
-def format_senior_all_careers_sms(pathway: str, lang: str) -> str:
-    """All 10 careers — sent as reply to MORE command."""
-    careers = SENIOR_CAREERS.get(pathway, SENIOR_CAREERS["STEM"])
-    demand_label = {"en": "Demand", "sw": "Mahitaji", "lh": "Haja", "ki": "Hitaji"}
-
-    msg = f"All {pathway} Careers\nKenya Labour Market 2025\n"
-    for name, stars, salary, trend in careers:
-        msg += f"\n• {name} {stars}\n  KES {salary}\n  {trend}\n"
-    return msg
-
-
-# =============================================================
-#  PATCH: Add MORE command handler to SMS webhook
-#  and update Senior result to use new career data
-# =============================================================
-
-@app.post("/sms/more", response_class=PlainTextResponse)
-async def sms_more(from_: str = Form(..., alias="from"), text: str = Form(...)):
-    """
-    Handles MORE command — sends all 10 careers with full labour market data.
-    AT routes this from the main /sms webhook via text=="MORE".
-    """
-    pass  # Handled inside main /sms webhook below — this is a placeholder
