@@ -40,10 +40,10 @@ def init_db():
             level TEXT, grade TEXT, term TEXT, pathway TEXT,
             math INTEGER, science INTEGER, social INTEGER,
             creative INTEGER, technical INTEGER,
-            career_interest TEXT, state TEXT
+            career_interest TEXT, state TEXT, mode TEXT
         )
     """)
-    for col in ["lang","grade","term","pathway","career_interest"]:
+    for col in ["lang","grade","term","pathway","career_interest","mode"]:
         cur.execute(f"ALTER TABLE students ADD COLUMN IF NOT EXISTS {col} TEXT")
 
     cur.execute("""
@@ -52,10 +52,10 @@ def init_db():
             level TEXT, grade TEXT, term TEXT, pathway TEXT,
             math INTEGER, science INTEGER, social INTEGER,
             creative INTEGER, technical INTEGER,
-            career_interest TEXT, state TEXT
+            career_interest TEXT, state TEXT, mode TEXT
         )
     """)
-    for col in ["lang","grade","term","pathway","career_interest"]:
+    for col in ["lang","grade","term","pathway","career_interest","mode"]:
         cur.execute(f"ALTER TABLE ussd_students ADD COLUMN IF NOT EXISTS {col} TEXT")
 
     cur.execute("""
@@ -725,6 +725,164 @@ RULES:
 """
 
 # =============================================================
+#  MODE SELECT — shown after language is chosen
+#  Mode 1: Pathway & Careers (assessment flow)
+#  Mode 2: CBE Assistant     (free-text RAG chat)
+# =============================================================
+
+MODE_SELECT_MSG = {
+    "en": (
+        "What would you like to do?\n"
+        "1. Pathway & Career Guide\n"
+        "   (assess your level & explore careers)\n"
+        "2. CBE Assistant\n"
+        "   (ask questions, homework help)"
+    ),
+    "sw": (
+        "Unataka kufanya nini?\n"
+        "1. Mwongozo wa Njia & Kazi\n"
+        "   (tathmini kiwango chako)\n"
+        "2. Msaidizi wa CBE\n"
+        "   (uliza maswali, msaada wa kazi)"
+    ),
+    "lh": (
+        "Okhwenenda khukola nini?\n"
+        "1. Mwongozo wa Njia & Emilimo\n"
+        "2. Msaidizi wa CBE\n"
+        "   (uliza maswali, msaada wa masomo)"
+    ),
+    "ki": (
+        "Ni uria ukenda gukora?\n"
+        "1. Mwongozo wa Njia & Mirimo\n"
+        "2. Msaidizi wa CBE\n"
+        "   (uiguithia maswali, uthuri wa masomo)"
+    ),
+}
+
+RAG_WELCOME_MSG = {
+    "en": (
+        "CBE Assistant ready!\n"
+        "Ask me anything about:\n"
+        "- CBE subjects & pathways\n"
+        "- Assignment help\n"
+        "- How CBE works\n"
+        "- Career questions\n\n"
+        "Just type your question.\n"
+        "Reply MENU to go back."
+    ),
+    "sw": (
+        "Msaidizi wa CBE yuko tayari!\n"
+        "Niulize chochote kuhusu:\n"
+        "- Masomo & njia za CBE\n"
+        "- Msaada wa kazi za nyumbani\n"
+        "- Maswali ya kazi\n\n"
+        "Andika swali lako.\n"
+        "Jibu MENU kurudi."
+    ),
+    "lh": (
+        "Msaidizi wa CBE yuko tayari!\n"
+        "Niulize chochote:\n"
+        "- Masomo & njia za CBE\n"
+        "- Msaada wa kazi\n\n"
+        "Andika swali lako.\n"
+        "Jibu MENU kurudi."
+    ),
+    "ki": (
+        "Msaidizi wa CBE arĩ ũhoro!\n"
+        "Niiguithia ũũ wowote:\n"
+        "- Masomo & njia cia CBE\n"
+        "- Uthuri wa ũthuri\n\n"
+        "Andika swali riaku.\n"
+        "Cookia MENU gũthiĩ."
+    ),
+}
+
+# =============================================================
+#  GEMINI FUNCTION 4 — RAG CHAT (Mode 2)
+#  Dedicated conversational assistant for open-ended CBE help.
+#  Document context is injected via DOCUMENT_CONTEXT —
+#  replace with real retrieved chunks from your CBE PDFs later.
+# =============================================================
+
+# Placeholder — populate with retrieved CBE curriculum document
+# chunks when you link your document store.
+DOCUMENT_CONTEXT = """
+[CBE curriculum document context will be injected here once linked.
+ This will include syllabus guides, past papers, and pathway descriptions.]
+"""
+
+CBE_ASSISTANT_SYSTEM = """
+You are EduTena CBE Assistant — a friendly, knowledgeable tutor for
+Kenyan students and parents navigating the Competency Based Education (CBE) system.
+
+You can help with:
+- Explaining CBE concepts, competency levels, and how the system works
+- Homework and assignment guidance (explain concepts, don't just give answers)
+- Subject-specific questions across JSS and Senior Secondary subjects
+- Pathway and career exploration
+- How to prepare a CBE portfolio for university entry
+- Understanding CBE vs the old 844 system
+- Advice for parents supporting their children in CBE
+
+DOCUMENT CONTEXT (CBE curriculum materials):
+{document_context}
+
+RULES:
+- SMS only — keep responses under 320 characters (2 SMS messages max)
+- Be warm, speak like a trusted Kenyan teacher
+- For homework: guide the student to think, don't just give the answer
+- If completely unrelated to CBE/education, politely redirect
+- NEVER give medical, legal, or financial investment advice
+"""
+
+async def ask_gemini_rag(phone: str, question: str, lang: str) -> str:
+    """
+    Mode 2: CBE Assistant — richer prompt, document context, conversation memory.
+    """
+    if not GEMINI_KEY:
+        return "CBE Assistant is not configured yet. Reply MENU to go back."
+
+    history = get_chat_history(phone, limit=8)
+    history_text = "".join(f"{r.upper()}: {m}\n" for r, m in history)
+
+    lang_instruction = {
+        "sw": "Respond in Kiswahili.",
+        "lh": "Respond in simple Luhya mixed with English.",
+        "ki": "Respond in simple Kikuyu mixed with English.",
+    }.get(lang, "Respond in English.")
+
+    system = CBE_ASSISTANT_SYSTEM.format(document_context=DOCUMENT_CONTEXT)
+
+    prompt = (
+        f"{system}\n\n"
+        f"{lang_instruction}\n\n"
+        f"CONVERSATION HISTORY:\n{history_text}\n"
+        f"STUDENT: {question}\n\n"
+        f"EDUTENA (2 SMS max, warm, helpful, end with encouragement):"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"maxOutputTokens": 200, "temperature": 0.5},
+                }
+            )
+            data   = response.json()
+            answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            save_chat(phone, "user", question)
+            save_chat(phone, "assistant", answer)
+            if "MENU" not in answer.upper():
+                answer += "\n\nReply MENU to return to the main menu."
+            return answer
+    except Exception as e:
+        print(f"[GEMINI rag_chat] Error: {e}")
+        return "Sorry, I could not answer that right now. Try again or reply MENU to go back."
+
+
+# =============================================================
 #  GEMINI FUNCTION 1 — PERSONALISED CAREER NARRATIVE
 #  Triggered after a Senior student picks a career.
 #  Uses their grade + pathway + career choice to generate
@@ -1074,6 +1232,7 @@ LANG_SELECT_MSG = (
 SMS_MENU = {
     "en": {
         "lang_confirm":   "Language: English\nReply START to begin.",
+        "mode_err":       "Invalid. Reply 1 for Pathway & Careers or 2 for CBE Assistant.",
         "welcome":        "EduTena CBE\nSelect Level:\n1. JSS (Grade 7-9)\n2. Senior (Grade 10-12)",
         "level_err":      "Invalid. Reply 1 for JSS or 2 for Senior.",
         "jss_grade":      "Select JSS Grade:\n1. Grade 7\n2. Grade 8\n3. Grade 9",
@@ -1094,6 +1253,7 @@ SMS_MENU = {
     },
     "sw": {
         "lang_confirm":   "Lugha: Kiswahili\nJibu START kuanza.",
+        "mode_err":       "Batili. Jibu 1 kwa Mwongozo wa Kazi au 2 kwa Msaidizi wa CBE.",
         "welcome":        "EduTena CBE\nChagua Kiwango:\n1. JSS (Darasa 7-9)\n2. Sekondari (Darasa 10-12)",
         "level_err":      "Batili. Jibu 1 kwa JSS au 2 kwa Sekondari.",
         "jss_grade":      "Chagua Darasa la JSS:\n1. Darasa 7\n2. Darasa 8\n3. Darasa 9",
@@ -1114,6 +1274,7 @@ SMS_MENU = {
     },
     "lh": {
         "lang_confirm":   "Olulimi: Luhya\nJibu START okhuandaa.",
+        "mode_err":       "Busia. Jibu 1 kwa Mwongozo kamba 2 kwa Msaidizi wa CBE.",
         "welcome":        "EduTena CBE\nSena Engufu:\n1. JSS (Okhufunda 7-9)\n2. Sekondari (Okhufunda 10-12)",
         "level_err":      "Busia. Jibu 1 kwa JSS kamba 2 kwa Sekondari.",
         "jss_grade":      "Sena Okhufunda lwa JSS:\n1. Okhufunda 7\n2. Okhufunda 8\n3. Okhufunda 9",
@@ -1134,6 +1295,7 @@ SMS_MENU = {
     },
     "ki": {
         "lang_confirm":   "Rurimi: Kikuyu\nCookia START guthomia.",
+        "mode_err":       "Ti wegwaru. Cookia 1 kwa Mwongozo kana 2 kwa Msaidizi wa CBE.",
         "welcome":        "EduTena CBE\nThura Kiwango:\n1. JSS (Kiwango 7-9)\n2. Sekondari (Kiwango 10-12)",
         "level_err":      "Ti wegwaru. Cookia 1 JSS kana 2 Sekondari.",
         "jss_grade":      "Thura Kiwango kia JSS:\n1. Kiwango 7\n2. Kiwango 8\n3. Kiwango 9",
@@ -1162,7 +1324,7 @@ SMS_MENU = {
 SMS_ALLOWED = {
     "lang","level","grade","term","pathway",
     "math","science","social","creative","technical",
-    "career_interest","state"
+    "career_interest","state","mode"
 }
 
 def sms_save(phone, field, value):
@@ -1178,7 +1340,7 @@ def sms_get(phone):
     cur.execute("""
         SELECT phone, lang, level, grade, term, pathway,
                math, science, social, creative, technical,
-               career_interest, state
+               career_interest, state, mode
         FROM students WHERE phone=%s
     """, (phone,))
     s = cur.fetchone(); cur.close(); conn.close()
@@ -1219,16 +1381,40 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
     # ── Always restart fresh on START ────────────────────────────
     if text_upper == "START" or not student:
         sms_save(phone, "state", "LANG")
+        sms_save(phone, "mode", "")
         await send_reply(phone, LANG_SELECT_MSG)
         return ""
 
     lang  = student[1] if student[1] in SMS_MENU else "en"
     state = student[12]
+    mode  = student[13] or ""   # index 13 = mode column
     M     = SMS_MENU[lang]
 
-    # ── GEMINI #3: RESUME — restore paused state ─────────────────
-    # Student asked a mid-flow question → state is PAUSED_<original>
-    # When they reply RESUME, unpause and re-prompt the original step
+    # ── MENU command — return to mode select from anywhere ───────
+    if text_upper == "MENU":
+        sms_save(phone, "state", "MODE_SELECT")
+        sms_save(phone, "mode", "")
+        await send_reply(phone, MODE_SELECT_MSG.get(lang, MODE_SELECT_MSG["en"]))
+        return ""
+
+    # ═══════════════════════════════════════════════════════════
+    #  MODE 2 — RAG CHAT
+    #  Student is in free-text conversation mode.
+    #  Every message goes to Gemini until they reply MENU/START.
+    # ═══════════════════════════════════════════════════════════
+    if state == "RAG_CHAT" or mode == "rag":
+        # Keep state consistent
+        if state != "RAG_CHAT":
+            sms_save(phone, "state", "RAG_CHAT")
+        answer = await ask_gemini_rag(phone, text_clean, lang)
+        await send_reply(phone, answer)
+        return ""
+
+    # ═══════════════════════════════════════════════════════════
+    #  MODE 1 — ASSESSMENT FLOW
+    # ═══════════════════════════════════════════════════════════
+
+    # ── RESUME — restore paused assessment state ──────────────
     if text_upper == "RESUME":
         original = get_paused_state(state)
         if original:
@@ -1239,29 +1425,23 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
             await send_reply(phone, M.get("done", "Reply START to begin."))
         return ""
 
-    # ── GEMINI #3: Mid-flow question detection ───────────────────
-    # If student is PAUSED (already asked a question), keep answering
-    # until they say RESUME. Also detect new questions in non-strict states.
+    # ── Mid-assessment pause: detect question while in flow ───
     paused_original = get_paused_state(state)
     if paused_original:
-        # They are paused — treat any non-RESUME text as a follow-up question
         if is_cbe_question(text_clean, state=""):
             answer = await ask_gemini(phone, text_clean, context_state=paused_original)
             await send_reply(phone, answer)
             return ""
-        # If they sent a digit/command while paused, nudge them to RESUME
-        await send_reply(phone, f"Still paused. Reply RESUME to continue your assessment, or ask another CBE question.")
+        await send_reply(phone, "Still paused. Reply RESUME to continue your assessment.")
         return ""
 
-    # Detect a fresh mid-flow question (in non-strict state)
     if is_cbe_question(text_clean, state=state):
-        # Pause the current state, answer the question
         pause_state(phone, state, sms_save)
         answer = await ask_gemini(phone, text_clean, context_state=state)
         await send_reply(phone, answer)
         return ""
 
-    # ── MORE command ──────────────────────────────────────────────
+    # ── MORE command ──────────────────────────────────────────
     if text_upper == "MORE":
         pathway = student[5]
         grade   = student[3] or ""
@@ -1270,7 +1450,7 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
         sms_save(phone, "state", "CAREER_SELECT_ALL")
         return ""
 
-    # ── CAREERS command ───────────────────────────────────────────
+    # ── CAREERS command ───────────────────────────────────────
     if text_upper == "CAREERS":
         pathway = student[5]
         grade   = student[3] or ""
@@ -1280,16 +1460,31 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
         return ""
 
     try:
-        # ── Language selection ────────────────────────────────────
+        # ── Language selection ────────────────────────────────
         if state == "LANG":
             chosen = LANG_MAP.get(text_clean)
             if not chosen:
                 await send_reply(phone, LANG_SELECT_MSG); return ""
             sms_save(phone, "lang", chosen)
-            sms_save(phone, "state", "LEVEL")
-            await send_reply(phone, SMS_MENU[chosen]["welcome"])
+            sms_save(phone, "state", "MODE_SELECT")
+            await send_reply(phone, MODE_SELECT_MSG.get(chosen, MODE_SELECT_MSG["en"]))
 
-        # ── Level ─────────────────────────────────────────────────
+        # ── Mode selection ────────────────────────────────────
+        elif state == "MODE_SELECT":
+            if text_clean == "1":
+                # Mode 1: Pathway & Career assessment
+                sms_save(phone, "mode", "assessment")
+                sms_save(phone, "state", "LEVEL")
+                await send_reply(phone, M["welcome"])
+            elif text_clean == "2":
+                # Mode 2: CBE RAG Assistant
+                sms_save(phone, "mode", "rag")
+                sms_save(phone, "state", "RAG_CHAT")
+                await send_reply(phone, RAG_WELCOME_MSG.get(lang, RAG_WELCOME_MSG["en"]))
+            else:
+                await send_reply(phone, M["mode_err"])
+
+        # ── Level ─────────────────────────────────────────────
         elif state == "LEVEL":
             if text_clean == "1":
                 sms_save(phone, "level", "JSS")
@@ -1302,7 +1497,7 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
             else:
                 await send_reply(phone, M["level_err"])
 
-        # ── JSS Grade ─────────────────────────────────────────────
+        # ── JSS Grade ─────────────────────────────────────────
         elif state == "JSS_GRADE":
             g = JSS_GRADES.get(text_clean)
             if not g:
@@ -1311,7 +1506,7 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
             sms_save(phone, "state", "TERM")
             await send_reply(phone, M["term"])
 
-        # ── Senior Grade → skip term, go straight to pathway ─────
+        # ── Senior Grade → skip term, go to pathway ───────────
         elif state == "SENIOR_GRADE":
             g = SENIOR_GRADES.get(text_clean)
             if not g:
@@ -1320,7 +1515,7 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
             sms_save(phone, "state", "SENIOR_PATHWAY")
             await send_reply(phone, M["senior_pathway"])
 
-        # ── Term (JSS only) ───────────────────────────────────────
+        # ── Term (JSS only) ───────────────────────────────────
         elif state == "TERM":
             t = TERMS.get(text_clean)
             if not t:
@@ -1329,7 +1524,7 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
             sms_save(phone, "state", "MATH")
             await send_reply(phone, f"Rate Math:\n{RATING_OPTIONS_SMS}")
 
-        # ── Senior Pathway → show career list ────────────────────
+        # ── Senior Pathway → career list ──────────────────────
         elif state == "SENIOR_PATHWAY":
             chosen = PATHWAYS.get(text_clean)
             if not chosen:
@@ -1339,7 +1534,7 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
             grade = student[3] or ""
             await send_reply(phone, get_career_list_sms(chosen, lang, grade))
 
-        # ── JSS Subject Ratings ───────────────────────────────────
+        # ── JSS Subject Ratings ───────────────────────────────
         elif state == "MATH":
             score = RATING_MAP.get(text_clean)
             if not score:
@@ -1387,17 +1582,15 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
                 sms_save(phone, "state", "DONE")
                 await send_reply(phone, M["pathway_msg"].format(pathway=pathway))
             else:
-                # ── GEMINI #2: AI-personalised JSS improvement suggestions ──
+                # GEMINI #2: AI-personalised JSS suggestions
                 suggestions = await gemini_jss_suggestions(
-                    grade, term,
-                    s[6], s[7], s[8], s[9], s[10],
-                    lang
+                    grade, term, s[6], s[7], s[8], s[9], s[10], lang
                 )
                 sms_save(phone, "state", "DONE")
                 await send_reply(phone, M["tracking_hdr"].format(grade=grade, term=term)
                                  + M["suggestion"].format(suggestions=suggestions))
 
-        # ── Career Selection (top 5 list) ─────────────────────────
+        # ── Career Selection (top 5) ──────────────────────────
         elif state == "CAREER_SELECT":
             pathway = student[5]
             if not pathway: await send_reply(phone, M["no_pathway"]); return ""
@@ -1406,13 +1599,11 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
                 name, demand, trend, subjects, unis, reqs = SENIOR_CAREERS[pathway][idx]
                 sms_save(phone, "career_interest", name)
                 sms_save(phone, "state", "DONE")
-                # Send static career detail first (fast, no Gemini latency)
+                # Static detail first (no latency)
                 await send_reply(phone, get_career_detail_sms(pathway, idx, lang))
-                # ── GEMINI #1: Personalised career narrative (second SMS) ──
+                # GEMINI #1: Personalised career narrative
                 grade = student[3] or ""
-                narrative = await gemini_career_narrative(
-                    grade, pathway, name, subjects, demand, lang
-                )
+                narrative = await gemini_career_narrative(grade, pathway, name, subjects, demand, lang)
                 await send_reply(phone, narrative)
             elif text_upper == "MORE":
                 await send_reply(phone, get_all_careers_sms(pathway, lang))
@@ -1420,7 +1611,7 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
             else:
                 await send_reply(phone, M["invalid_career"])
 
-        # ── Career Selection (all 10 list) ────────────────────────
+        # ── Career Selection (all 10) ─────────────────────────
         elif state == "CAREER_SELECT_ALL":
             pathway = student[5]
             if not pathway: await send_reply(phone, M["no_pathway"]); return ""
@@ -1430,11 +1621,9 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
                 sms_save(phone, "career_interest", name)
                 sms_save(phone, "state", "DONE")
                 await send_reply(phone, get_career_detail_sms(pathway, idx, lang))
-                # ── GEMINI #1: Personalised career narrative ──────
+                # GEMINI #1: Personalised career narrative
                 grade = student[3] or ""
-                narrative = await gemini_career_narrative(
-                    grade, pathway, name, subjects, demand, lang
-                )
+                narrative = await gemini_career_narrative(grade, pathway, name, subjects, demand, lang)
                 await send_reply(phone, narrative)
             else:
                 await send_reply(phone, M["invalid_career"])
@@ -1456,7 +1645,7 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
 USSD_ALLOWED = {
     "lang","level","grade","term","pathway",
     "math","science","social","creative","technical",
-    "career_interest","state"
+    "career_interest","state","mode"
 }
 
 def ussd_save(phone, field, value):
@@ -1472,7 +1661,7 @@ def ussd_get(phone):
     cur.execute("""
         SELECT phone, lang, level, grade, term, pathway,
                math, science, social, creative, technical,
-               career_interest, state
+               career_interest, state, mode
         FROM ussd_students WHERE phone=%s
     """, (phone,))
     s = cur.fetchone(); cur.close(); conn.close()
@@ -1491,7 +1680,7 @@ def ussd_reset(phone):
         UPDATE ussd_students
         SET lang=NULL, level=NULL, grade=NULL, term=NULL, pathway=NULL,
             math=NULL, science=NULL, social=NULL, creative=NULL,
-            technical=NULL, career_interest=NULL, state='LANG'
+            technical=NULL, career_interest=NULL, mode=NULL, state='LANG'
         WHERE phone=%s
     """, (phone,))
     conn.commit(); cur.close(); conn.close()
@@ -1538,14 +1727,35 @@ async def ussd_callback(
             if not chosen:
                 return con("Invalid.\n1. English\n2. Swahili\n3. Luhya\n4. Kikuyu")
             ussd_save(phone, "lang", chosen)
-            ussd_save(phone, "state", "LEVEL")
-            labels = {
-                "en": "EduTena CBE\n1. JSS (Gr 7-9)\n2. Senior (Gr 10-12)",
-                "sw": "EduTena CBE\n1. JSS (Darasa 7-9)\n2. Sekondari (Darasa 10-12)",
-                "lh": "EduTena CBE\n1. JSS (Okhufunda 7-9)\n2. Sekondari (Okhufunda 10-12)",
-                "ki": "EduTena CBE\n1. JSS (Kiwango 7-9)\n2. Sekondari (Kiwango 10-12)",
-            }
-            return con(labels.get(chosen, labels["en"]))
+            ussd_save(phone, "state", "MODE_SELECT")
+            return con(
+                "EduTena CBE\nWhat would you like?\n"
+                "1. Pathway & Career Guide\n"
+                "2. CBE Assistant\n"
+                "   (SMS only - text START\n    on SMS for CBE help)"
+            )
+
+        elif state == "MODE_SELECT":
+            if step == "1":
+                ussd_save(phone, "mode", "assessment")
+                ussd_save(phone, "state", "LEVEL")
+                labels = {
+                    "en": "EduTena CBE\n1. JSS (Gr 7-9)\n2. Senior (Gr 10-12)",
+                    "sw": "EduTena CBE\n1. JSS (Darasa 7-9)\n2. Sekondari (Darasa 10-12)",
+                    "lh": "EduTena CBE\n1. JSS (Okhufunda 7-9)\n2. Sekondari (Okhufunda 10-12)",
+                    "ki": "EduTena CBE\n1. JSS (Kiwango 7-9)\n2. Sekondari (Kiwango 10-12)",
+                }
+                return con(labels.get(lang, labels["en"]))
+            elif step == "2":
+                # CBE Assistant is SMS-only — USSD can't support free-text chat
+                return end(
+                    "CBE Assistant is available on SMS only.\n\n"
+                    "Text START to the same number to chat\n"
+                    "with the CBE Assistant and get help\n"
+                    "with homework, pathways & more!"
+                )
+            else:
+                return con("Invalid.\n1. Pathway & Career Guide\n2. CBE Assistant (SMS only)")
 
         elif state == "LEVEL":
             if step == "1":
