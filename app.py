@@ -54,6 +54,22 @@ def init_db():
     for col in ["lang", "grade", "term"]:
         cur.execute(f"ALTER TABLE ussd_students ADD COLUMN IF NOT EXISTS {col} TEXT")
 
+    # Clean corrupted rows where lang has wrong value (old schema leftover)
+    cur.execute("""
+        UPDATE students SET lang='en', state='LANG',
+            level=NULL, grade=NULL, term=NULL,
+            math=NULL, science=NULL, social=NULL,
+            creative=NULL, technical=NULL, pathway=NULL
+        WHERE lang NOT IN ('en','sw','lh','ki') OR lang IS NULL
+    """)
+    cur.execute("""
+        UPDATE ussd_students SET lang='en', state='LANG',
+            level=NULL, grade=NULL, term=NULL,
+            math=NULL, science=NULL, social=NULL,
+            creative=NULL, technical=NULL, pathway=NULL
+        WHERE lang NOT IN ('en','sw','lh','ki') OR lang IS NULL
+    """)
+
     conn.commit()
     cur.close()
     conn.close()
@@ -290,9 +306,17 @@ def sms_save(phone, field, value):
 
 def sms_get(phone):
     conn = get_connection(); cur = conn.cursor()
-    cur.execute("SELECT * FROM students WHERE phone=%s", (phone,))
+    cur.execute("""
+        SELECT phone, lang, level, grade, term,
+               math, science, social, creative, technical,
+               pathway, state
+        FROM students WHERE phone=%s
+    """, (phone,))
     s = cur.fetchone(); cur.close(); conn.close()
     return s
+    # phone(0) lang(1) level(2) grade(3) term(4)
+    # math(5) science(6) social(7) creative(8) technical(9)
+    # pathway(10) state(11)
 
 def sms_calculate_pathway(phone):
     s = sms_get(phone)
@@ -327,7 +351,7 @@ async def receive_sms(from_: str = Form(..., alias="from"), text: str = Form(...
         await send_reply(phone, LANG_SELECT_MSG)
         return ""
 
-    lang  = student[1] or "en"
+    lang  = student[1] if student[1] in SMS_MENU else "en"
     state = student[11]
     M     = SMS_MENU[lang]
 
@@ -512,9 +536,17 @@ def ussd_save(phone, field, value):
 
 def ussd_get(phone):
     conn = get_connection(); cur = conn.cursor()
-    cur.execute("SELECT * FROM ussd_students WHERE phone=%s", (phone,))
+    cur.execute("""
+        SELECT phone, lang, level, grade, term,
+               math, science, social, creative, technical,
+               pathway, state
+        FROM ussd_students WHERE phone=%s
+    """, (phone,))
     s = cur.fetchone(); cur.close(); conn.close()
     return s
+    # phone(0) lang(1) level(2) grade(3) term(4)
+    # math(5) science(6) social(7) creative(8) technical(9)
+    # pathway(10) state(11)
 
 def ussd_calculate_pathway(phone):
     s = ussd_get(phone)
@@ -570,7 +602,7 @@ async def ussd_callback(
         )
 
     state = student[11]
-    lang  = student[1] or "en"
+    lang  = student[1] if student[1] in SMS_MENU else "en"
 
     try:
         # ── Language selection ───────────────────────────────────
