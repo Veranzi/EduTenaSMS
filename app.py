@@ -6,6 +6,7 @@ import os
 import httpx
 import asyncio
 import africastalking
+import re
 
 app = FastAPI()
 
@@ -71,8 +72,96 @@ def init_db():
     conn.commit(); cur.close(); conn.close()
 
 @app.on_event("startup")
-def startup():
+async def startup():
     init_db()
+    await load_documents()
+
+# =============================================================
+#  DOCUMENT LOADING FROM GITHUB
+# =============================================================
+
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/Veranzi/EduTenaSMS/main/data"
+
+DOCUMENT_CONTEXT = ""
+
+async def load_documents():
+    global DOCUMENT_CONTEXT
+    docs = []
+
+    # Fetch subject combinations PDF
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(f"{GITHUB_RAW_BASE}/subject-combinations-senior-schools.pdf")
+            if r.status_code == 200:
+                # Save locally and extract text with pdfminer
+                with open("/tmp/subject-combinations.pdf", "wb") as f:
+                    f.write(r.content)
+                text = extract_pdf_text("/tmp/subject-combinations.pdf")
+                if text:
+                    docs.append("=== SUBJECT COMBINATIONS FOR SENIOR SCHOOLS ===\n" + text)
+                    print("[DOCS] subject-combinations-senior-schools.pdf loaded OK")
+                else:
+                    print("[DOCS] subject-combinations PDF extracted but empty")
+            else:
+                print(f"[DOCS] subject-combinations fetch failed: HTTP {r.status_code}")
+    except Exception as e:
+        print(f"[DOCS] subject-combinations error: {e}")
+
+    # Fetch The Last Laugh docx
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(f"{GITHUB_RAW_BASE}/The last laugh.docx")
+            if r.status_code == 200:
+                with open("/tmp/the-last-laugh.docx", "wb") as f:
+                    f.write(r.content)
+                text = extract_docx_text("/tmp/the-last-laugh.docx")
+                if text:
+                    docs.append("=== THE LAST LAUGH — GRADE 9 SET BOOK ===\n" + text)
+                    print("[DOCS] The last laugh.docx loaded OK")
+                else:
+                    print("[DOCS] The last laugh docx extracted but empty")
+            else:
+                print(f"[DOCS] The last laugh fetch failed: HTTP {r.status_code}")
+    except Exception as e:
+        print(f"[DOCS] The last laugh error: {e}")
+
+    if docs:
+        DOCUMENT_CONTEXT = "\n\n".join(docs)
+        print(f"[DOCS] DOCUMENT_CONTEXT loaded: {len(DOCUMENT_CONTEXT)} characters")
+    else:
+        DOCUMENT_CONTEXT = "(Documents could not be loaded at startup — using built-in CBE knowledge.)"
+        print("[DOCS] No documents loaded, using fallback")
+
+
+def extract_pdf_text(filepath: str) -> str:
+    try:
+        from pdfminer.high_level import extract_text
+        return extract_text(filepath).strip()
+    except ImportError:
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["python3", "-m", "pdfminer.high_level", filepath],
+                capture_output=True, text=True, timeout=20
+            )
+            return result.stdout.strip()
+        except Exception as e:
+            print(f"[PDF] extraction error: {e}")
+            return ""
+    except Exception as e:
+        print(f"[PDF] extraction error: {e}")
+        return ""
+
+
+def extract_docx_text(filepath: str) -> str:
+    try:
+        from docx import Document
+        doc = Document(filepath)
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+    except Exception as e:
+        print(f"[DOCX] extraction error: {e}")
+        return ""
+
 
 # =============================================================
 #  SHARED CONSTANTS
@@ -223,8 +312,7 @@ SENIOR_CAREERS = {
 }
 
 # =============================================================
-#  MULTILINGUAL UI  — single source of truth for ALL text
-#  Use t(lang, key, **kwargs) to fetch any string.
+#  MULTILINGUAL UI
 # =============================================================
 
 UI = {
@@ -258,30 +346,30 @@ UI = {
         "all_career_footer":   "\nReply 1-10 to select.",
         "no_pathway":          "Complete your assessment first. Reply START.",
         "invalid_career":      "Invalid. Reply a number from the career list.",
-        "career_detail":       "━━━━━━━━━━━━━━━━━━━━\nCAREER: {name}\n━━━━━━━━━━━━━━━━━━━━\n\nMarket Demand: {demand} of Kenyan job postings 2025\nTrend: {trend}\n\n📚 Focus Subjects:\n{subjects}\n\n🏫 Universities & Colleges:\n{unis}\n\n📋 CBE Entry Requirements:\n{reqs}\n\n✅ Saved to your profile!\nReply START to reassess or MENU to go back.",
-        "ussd_career_end":     "✅ {name}\nDemand: {demand} | {trend}\n\n📚 Focus Subjects:\n{subjects}\n\n🏫 Colleges:\n{unis}\n\n📋 CBE Requirements:\n{reqs}\n\n📱 Full details + personal advice\nsent to your SMS now!",
+        "career_detail":       "CAREER: {name}\n\nMarket Demand: {demand} of Kenyan job postings 2025\nTrend: {trend}\n\nFocus Subjects:\n{subjects}\n\nUniversities and Colleges:\n{unis}\n\nCBE Entry Requirements:\n{reqs}\n\nSaved to your profile! Reply START to reassess or MENU to go back.",
+        "ussd_career_end":     "{name}\nDemand: {demand} | {trend}\n\nFocus Subjects:\n{subjects}\n\nColleges:\n{unis}\n\nCBE Requirements:\n{reqs}\n\nFull details and personal advice sent to your SMS now!",
         "tracking_hdr":        "Performance: {grade} | {term}\n",
         "suggestion":          "{suggestions}\nYou can also ask any CBE question by texting it!",
-        "ussd_jss_result":     "{grade} | {term}\nBest subject: {strongest}\nNeeds work: {weak}\n\n📱 Full advice sent via SMS!\n\n1. Restart\n2. Exit",
+        "ussd_jss_result":     "{grade} | {term}\nBest subject: {strongest}\nNeeds work: {weak}\n\nFull advice sent via SMS!\n\n1. Restart\n2. Exit",
         "ussd_pathway_result": "CBE Pathway: {pathway}\nStrongest: {top}\nScores: {summary}\n\n1. View Matched Careers\n2. See All Careers\n3. Restart\n4. Exit",
         "ussd_rag_menu":       "CBE Assistant\nAnswer sent via SMS\n\nPick a topic:\n1. What is CBE/CBC?\n2. Pathways explained\n3. How to build a portfolio\n4. CBE vs old 844 system\n5. University entry with CBE\n6. Ask your own (use SMS)",
-        "ussd_rag_sending":    "✅ Your answer is being\nprepared and will arrive\nvia SMS in ~30 seconds.\n\nDial back anytime!",
+        "ussd_rag_sending":    "Your answer is being prepared and will arrive via SMS in about 30 seconds.\n\nDial back anytime!",
         "ussd_rag_sms_tip":    "To ask your own question:\n\nText START to this number,\nselect option 2 (CBE Assistant)\nthen type any question.\nFull answers, no length limit!",
         "done":                "Assessment saved. Reply CAREERS or ask any CBE question!",
         "paused":              "Still paused. Reply RESUME to continue your assessment.",
         "thank_you":           "Thank you for using EduTena CBE. Good luck!",
         "error":               "Something went wrong. Please try again.",
         "resume_fallback":     "Reply START to begin your assessment.",
-        "rag_welcome":         "CBE Assistant ready!\nAsk me anything about:\n- CBE subjects & pathways\n- Assignment help\n- How CBE works\n- Career questions\n\nJust type your question.\nReply MENU to go back.",
+        "rag_welcome":         "CBE Assistant ready!\nAsk me anything about:\n- CBE subjects and pathways\n- Assignment help\n- How CBE works\n- Career questions\n\nJust type your question.\nReply MENU to go back.",
         "rag_menu_reminder":   "Reply MENU to return to the main menu.",
     },
     "sw": {
         "welcome_lang":        "Karibu EduTena CBE.\nChagua Lugha:\n1. Kiingereza\n2. Kiswahili\n3. Kiluhya\n4. Gĩkũyũ",
         "invalid_lang":        "Batili.\n1. Kiingereza\n2. Kiswahili\n3. Kiluhya\n4. Gĩkũyũ",
-        "mode_select":         "Unataka kufanya nini?\n1. Mwongozo wa Njia & Kazi\n   (tathmini kiwango chako)\n2. Msaidizi wa CBE\n   (uliza maswali, msaada wa kazi)",
+        "mode_select":         "Unataka kufanya nini?\n1. Mwongozo wa Njia na Kazi\n   (tathmini kiwango chako)\n2. Msaidizi wa CBE\n   (uliza maswali, msaada wa kazi)",
         "mode_err":            "Batili. Jibu 1 kwa Mwongozo au 2 kwa Msaidizi.",
-        "mode_ussd_2":         "EduTena CBE\nUnataka nini?\n1. Mwongozo wa Njia & Kazi\n2. Msaidizi wa CBE\n   (Jibu linatumwa kwa SMS)",
-        "mode_ussd_err":       "Batili.\n1. Mwongozo wa Njia & Kazi\n2. Msaidizi wa CBE",
+        "mode_ussd_2":         "EduTena CBE\nUnataka nini?\n1. Mwongozo wa Njia na Kazi\n2. Msaidizi wa CBE\n   (Jibu linatumwa kwa SMS)",
+        "mode_ussd_err":       "Batili.\n1. Mwongozo wa Njia na Kazi\n2. Msaidizi wa CBE",
         "rag_sms_only":        "Msaidizi wa CBE (SMS tu)\n\nTuma START kwa nambari hii,\nchagua chaguo 2, andika\nswali lolote la CBE.\nMajibu kamili, bila kikomo!",
         "welcome":             "EduTena CBE\nChagua Kiwango:\n1. JSS (Darasa 7-9)\n2. Sekondari (Darasa 10-12)",
         "level_err":           "Batili. Jibu 1 kwa JSS au 2 kwa Sekondari.",
@@ -290,7 +378,7 @@ UI = {
         "grade_err":           "Batili. Chagua 1, 2, au 3.",
         "term":                "Chagua Muhula:\n1. Muhula 1\n2. Muhula 2\n3. Muhula 3",
         "term_err":            "Batili. Chagua muhula 1, 2, au 3.",
-        "senior_pathway":      "Chagua Njia yako ya CBE:\n1. STEM\n   (Sayansi, Teknolojia, Hisabati)\n2. Sayansi Jamii\n   (Biashara, Sheria, Uchumi)\n3. Sanaa & Michezo\n   (Ubunifu, PE, Vyombo vya Habari)",
+        "senior_pathway":      "Chagua Njia yako ya CBE:\n1. STEM\n   (Sayansi, Teknolojia, Hisabati)\n2. Sayansi Jamii\n   (Biashara, Sheria, Uchumi)\n3. Sanaa na Michezo\n   (Ubunifu, PE, Vyombo vya Habari)",
         "pathway_err":         "Batili. Chagua 1, 2, au 3.",
         "pathway_msg":         "Njia Inayotabirika: {pathway}\nKulingana na alama zako za Darasa 9.\nJibu CAREERS kuona kazi zinazolingana.",
         "rate_math":           "Tathmini utendaji wako wa Hisabati:\n{opts}",
@@ -305,30 +393,30 @@ UI = {
         "all_career_footer":   "\nJibu 1-10 kuchagua.",
         "no_pathway":          "Maliza tathmini kwanza. Jibu START.",
         "invalid_career":      "Batili. Jibu nambari kutoka orodha ya kazi.",
-        "career_detail":       "━━━━━━━━━━━━━━━━━━━━\nKAZI: {name}\n━━━━━━━━━━━━━━━━━━━━\n\nMahitaji Sokoni: {demand} ya nafasi zote za kazi Kenya 2025\nMwelekeo: {trend}\n\n📚 Masomo ya Kuzingatia:\n{subjects}\n\n🏫 Vyuo:\n{unis}\n\n📋 Mahitaji ya CBE:\n{reqs}\n\n✅ Imehifadhiwa kwenye wasifu wako!\nJibu START kuanza upya au MENU kurudi.",
-        "ussd_career_end":     "✅ {name}\nMahitaji: {demand} | {trend}\n\n📚 Masomo ya Kuzingatia:\n{subjects}\n\n🏫 Vyuo:\n{unis}\n\n📋 Mahitaji ya CBE:\n{reqs}\n\n📱 Maelezo kamili + ushauri\nwametumwa kwa SMS yako sasa!",
+        "career_detail":       "KAZI: {name}\n\nMahitaji Sokoni: {demand} ya nafasi zote za kazi Kenya 2025\nMwelekeo: {trend}\n\nMasomo ya Kuzingatia:\n{subjects}\n\nVyuo:\n{unis}\n\nMahitaji ya CBE:\n{reqs}\n\nImehifadhiwa kwenye wasifu wako!\nJibu START kuanza upya au MENU kurudi.",
+        "ussd_career_end":     "{name}\nMahitaji: {demand} | {trend}\n\nMasomo ya Kuzingatia:\n{subjects}\n\nVyuo:\n{unis}\n\nMahitaji ya CBE:\n{reqs}\n\nMaelezo kamili na ushauri wametumwa kwa SMS yako sasa!",
         "tracking_hdr":        "Utendaji: {grade} | {term}\n",
         "suggestion":          "{suggestions}\nUnaweza pia kuuliza swali lolote la CBE!",
-        "ussd_jss_result":     "{grade} | {term}\nSomo bora: {strongest}\nZingatia zaidi: {weak}\n\n📱 Ushauri kamili umetumwa kwa SMS!\n\n1. Anza Upya\n2. Toka",
+        "ussd_jss_result":     "{grade} | {term}\nSomo bora: {strongest}\nZingatia zaidi: {weak}\n\nUshauri kamili umetumwa kwa SMS!\n\n1. Anza Upya\n2. Toka",
         "ussd_pathway_result": "Njia ya CBE: {pathway}\nNzuri zaidi: {top}\nAlama: {summary}\n\n1. Tazama Kazi Zinazolingana\n2. Tazama Kazi Zote\n3. Anza Upya\n4. Toka",
         "ussd_rag_menu":       "Msaidizi wa CBE\nJibu litatumwa kwa SMS\n\nChagua mada:\n1. CBE/CBC ni nini?\n2. Njia zote zimeelezwa\n3. Jinsi ya kuunda portfolio\n4. CBE vs mfumo wa zamani 844\n5. Kuingia chuo kikuu na CBE\n6. Uliza swali lako (SMS)",
-        "ussd_rag_sending":    "✅ Jibu lako linaandaliwa\nna litatumwa kwa SMS\ndakika moja.\n\nPiga simu tena wakati wowote!",
+        "ussd_rag_sending":    "Jibu lako linaandaliwa na litatumwa kwa SMS dakika moja.\n\nPiga simu tena wakati wowote!",
         "ussd_rag_sms_tip":    "Kuuliza swali lako mwenyewe:\n\nTuma START kwa nambari hii,\nchagua chaguo 2 (Msaidizi wa CBE)\nkisha andika swali lolote.\nMajibu kamili, bila kikomo!",
         "done":                "Imehifadhiwa. Jibu CAREERS au uliza swali lolote la CBE!",
         "paused":              "Bado imesimamishwa. Jibu RESUME kuendelea na tathmini yako.",
         "thank_you":           "Asante kwa kutumia EduTena CBE. Kila la heri!",
         "error":               "Hitilafu imetokea. Tafadhali jaribu tena.",
         "resume_fallback":     "Jibu START kuanza tathmini yako.",
-        "rag_welcome":         "Msaidizi wa CBE yuko tayari!\nNiulize chochote kuhusu:\n- Masomo & njia za CBE\n- Msaada wa kazi za nyumbani\n- Jinsi CBE inavyofanya kazi\n- Maswali ya kazi\n\nAndika swali lako.\nJibu MENU kurudi.",
+        "rag_welcome":         "Msaidizi wa CBE yuko tayari!\nNiulize chochote kuhusu:\n- Masomo na njia za CBE\n- Msaada wa kazi za nyumbani\n- Jinsi CBE inavyofanya kazi\n- Maswali ya kazi\n\nAndika swali lako.\nJibu MENU kurudi.",
         "rag_menu_reminder":   "Jibu MENU kurudi menyu kuu.",
     },
     "lh": {
         "welcome_lang":        "Karibu EduTena CBE.\nSena Olulimi:\n1. Kiingereza\n2. Kiswahili\n3. Kiluhya\n4. Gĩkũyũ",
         "invalid_lang":        "Busia.\n1. Kiingereza\n2. Kiswahili\n3. Kiluhya\n4. Gĩkũyũ",
-        "mode_select":         "Okhwenenda khukola nini?\n1. Mwongozo wa Njia & Emilimo\n2. Msaidizi wa CBE\n   (uliza maswali, msaada wa masomo)",
+        "mode_select":         "Okhwenenda khukola nini?\n1. Mwongozo wa Njia na Emilimo\n2. Msaidizi wa CBE\n   (uliza maswali, msaada wa masomo)",
         "mode_err":            "Busia. Jibu 1 kwa Mwongozo kamba 2 kwa Msaidizi.",
-        "mode_ussd_2":         "EduTena CBE\nOkhwenenda nini?\n1. Mwongozo wa Njia & Emilimo\n2. Msaidizi wa CBE\n   (Jibu linatumwa kwa SMS)",
-        "mode_ussd_err":       "Busia.\n1. Mwongozo wa Njia & Emilimo\n2. Msaidizi wa CBE",
+        "mode_ussd_2":         "EduTena CBE\nOkhwenenda nini?\n1. Mwongozo wa Njia na Emilimo\n2. Msaidizi wa CBE\n   (Jibu linatumwa kwa SMS)",
+        "mode_ussd_err":       "Busia.\n1. Mwongozo wa Njia na Emilimo\n2. Msaidizi wa CBE",
         "rag_sms_only":        "Msaidizi wa CBE (SMS tu)\n\nTuma START, sena 2,\nandika swali la CBE.",
         "welcome":             "EduTena CBE\nSena Engufu:\n1. JSS (Okhufunda 7-9)\n2. Sekondari (Okhufunda 10-12)",
         "level_err":           "Busia. Jibu 1 kwa JSS kamba 2 kwa Sekondari.",
@@ -337,7 +425,7 @@ UI = {
         "grade_err":           "Busia. Sena 1, 2, kamba 3.",
         "term":                "Sena Muhula:\n1. Muhula 1\n2. Muhula 2\n3. Muhula 3",
         "term_err":            "Busia. Sena muhula 1, 2, kamba 3.",
-        "senior_pathway":      "Sena Njia yako ya CBE:\n1. STEM\n   (Sayansi, Teknolojia, Hisabati)\n2. Sayansi Jamii\n   (Biashara, Sheria, Uchumi)\n3. Sanaa & Michezo\n   (Ubunifu, PE, Habari)",
+        "senior_pathway":      "Sena Njia yako ya CBE:\n1. STEM\n   (Sayansi, Teknolojia, Hisabati)\n2. Sayansi Jamii\n   (Biashara, Sheria, Uchumi)\n3. Sanaa na Michezo\n   (Ubunifu, PE, Habari)",
         "pathway_err":         "Busia. Sena 1, 2, kamba 3.",
         "pathway_msg":         "Njia Enyiseniwe: {pathway}\nKulingana na alama zako za Okhufunda 9.\nJibu CAREERS okhuona emilimo inayolingana.",
         "rate_math":           "Sena utendaji wako wa Hisabati:\n{opts}",
@@ -352,30 +440,30 @@ UI = {
         "all_career_footer":   "\nJibu 1-10 okukhusena.",
         "no_pathway":          "Maliza tathmini kwanza. Jibu START.",
         "invalid_career":      "Busia. Jibu nambari kutoka orodha ya emilimo.",
-        "career_detail":       "━━━━━━━━━━━━━━━━━━━━\nEMILIMO: {name}\n━━━━━━━━━━━━━━━━━━━━\n\nHaja Sokoni: {demand} ya nafasi zote Kenya 2025\nMwelekeo: {trend}\n\n📚 Masomo:\n{subjects}\n\n🏫 Vyuo:\n{unis}\n\n📋 Mahitaji ya CBE:\n{reqs}\n\n✅ Imehifadhiwa!\nJibu START okhuanza au MENU kurudi.",
-        "ussd_career_end":     "✅ {name}\nMahitaji: {demand} | {trend}\n\n📚 Masomo:\n{subjects}\n\n🏫 Vyuo:\n{unis}\n\n📋 Mahitaji ya CBE:\n{reqs}\n\n📱 Maelezo kamili + ushauri\nkwa SMS yako sasa!",
+        "career_detail":       "EMILIMO: {name}\n\nHaja Sokoni: {demand} ya nafasi zote Kenya 2025\nMwelekeo: {trend}\n\nMasomo:\n{subjects}\n\nVyuo:\n{unis}\n\nMahitaji ya CBE:\n{reqs}\n\nImehifadhiwa!\nJibu START okhuanza au MENU kurudi.",
+        "ussd_career_end":     "{name}\nMahitaji: {demand} | {trend}\n\nMasomo:\n{subjects}\n\nVyuo:\n{unis}\n\nMahitaji ya CBE:\n{reqs}\n\nMaelezo kamili na ushauri kwa SMS yako sasa!",
         "tracking_hdr":        "Okusema: {grade} | {term}\n",
         "suggestion":          "{suggestions}\nUnaweza pia kuuliza swali lolote la CBE!",
-        "ussd_jss_result":     "{grade} | {term}\nBora: {strongest}\nJaribu zaidi: {weak}\n\n📱 Ushauri kamili kwa SMS!\n\n1. Anza Upya\n2. Toka",
+        "ussd_jss_result":     "{grade} | {term}\nBora: {strongest}\nJaribu zaidi: {weak}\n\nUshauri kamili kwa SMS!\n\n1. Anza Upya\n2. Toka",
         "ussd_pathway_result": "Njia ya CBE: {pathway}\nBora: {top}\nAlama: {summary}\n\n1. Tazama Emilimo Inayolingana\n2. Tazama Emilimo Yote\n3. Anza Upya\n4. Toka",
         "ussd_rag_menu":       "Msaidizi wa CBE\nJibu kwa SMS\n\nChagua mada:\n1. CBE/CBC ni nini?\n2. Njia zimeelezwa\n3. Jinsi ya portfolio\n4. CBE vs 844\n5. Chuo kikuu na CBE\n6. Uliza swali lako (SMS)",
-        "ussd_rag_sending":    "✅ Jibu lako linaandaliwa\nna litatumwa kwa SMS.\n\nPiga simu tena wakati wowote!",
+        "ussd_rag_sending":    "Jibu lako linaandaliwa na litatumwa kwa SMS.\n\nPiga simu tena wakati wowote!",
         "ussd_rag_sms_tip":    "Kuuliza swali lako:\nTuma START, sena 2,\nandika swali lolote la CBE.",
         "done":                "Yakhwira. Jibu CAREERS kamba uliza swali la CBE!",
         "paused":              "Bado imesimamishwa. Jibu RESUME kuendelea.",
         "thank_you":           "Asante okhutumia EduTena CBE. Kila la heri!",
         "error":               "Hitilafu imetokea. Tafadhali jaribu tena.",
         "resume_fallback":     "Jibu START okhuanza tathmini yako.",
-        "rag_welcome":         "Msaidizi wa CBE yuko tayari!\nNiulize chochote:\n- Masomo & njia za CBE\n- Msaada wa kazi\n- Jinsi CBE inavyofanya kazi\n\nAndika swali lako.\nJibu MENU kurudi.",
+        "rag_welcome":         "Msaidizi wa CBE yuko tayari!\nNiulize chochote:\n- Masomo na njia za CBE\n- Msaada wa kazi\n- Jinsi CBE inavyofanya kazi\n\nAndika swali lako.\nJibu MENU kurudi.",
         "rag_menu_reminder":   "Jibu MENU kurudi menyu kuu.",
     },
     "ki": {
         "welcome_lang":        "Ũkaribũ EduTena CBE.\nThura Rurimi:\n1. Kiingereza\n2. Kiswahili\n3. Kiluhya\n4. Gĩkũyũ",
         "invalid_lang":        "Ti wegwaru.\n1. Kiingereza\n2. Kiswahili\n3. Kiluhya\n4. Gĩkũyũ",
-        "mode_select":         "Ni uria ukenda gukora?\n1. Mwongozo wa Njia & Mirimo\n   (tathmini kiwango chako)\n2. Msaidizi wa CBE\n   (uiguithia maswali, uthuri wa masomo)",
+        "mode_select":         "Ni uria ukenda gukora?\n1. Mwongozo wa Njia na Mirimo\n   (tathmini kiwango chako)\n2. Msaidizi wa CBE\n   (uiguithia maswali, uthuri wa masomo)",
         "mode_err":            "Ti wegwaru. Cookia 1 kwa Mwongozo kana 2 kwa Msaidizi.",
-        "mode_ussd_2":         "EduTena CBE\nNi uria ukenda?\n1. Mwongozo wa Njia & Mirimo\n2. Msaidizi wa CBE\n   (Jibu rigatumirwo na SMS)",
-        "mode_ussd_err":       "Ti wegwaru.\n1. Mwongozo wa Njia & Mirimo\n2. Msaidizi wa CBE",
+        "mode_ussd_2":         "EduTena CBE\nNi uria ukenda?\n1. Mwongozo wa Njia na Mirimo\n2. Msaidizi wa CBE\n   (Jibu rigatumirwo na SMS)",
+        "mode_ussd_err":       "Ti wegwaru.\n1. Mwongozo wa Njia na Mirimo\n2. Msaidizi wa CBE",
         "rag_sms_only":        "Msaidizi wa CBE (SMS tu)\n\nTuma START, thura 2,\nandika swali la CBE.",
         "welcome":             "EduTena CBE\nThura Kiwango:\n1. JSS (Kiwango 7-9)\n2. Sekondari (Kiwango 10-12)",
         "level_err":           "Ti wegwaru. Cookia 1 JSS kana 2 Sekondari.",
@@ -384,7 +472,7 @@ UI = {
         "grade_err":           "Ti wegwaru. Thura 1, 2, kana 3.",
         "term":                "Thura Muhula:\n1. Muhula 1\n2. Muhula 2\n3. Muhula 3",
         "term_err":            "Ti wegwaru. Thura 1, 2, kana 3.",
-        "senior_pathway":      "Thura Njia yaku ya CBE:\n1. STEM\n   (Sayansi, Teknolojia, Hisabati)\n2. Sayansi Jamii\n   (Biashara, Sheria, Uchumi)\n3. Sanaa & Michezo\n   (Ubunifu, PE, Habari)",
+        "senior_pathway":      "Thura Njia yaku ya CBE:\n1. STEM\n   (Sayansi, Teknolojia, Hisabati)\n2. Sayansi Jamii\n   (Biashara, Sheria, Uchumi)\n3. Sanaa na Michezo\n   (Ubunifu, PE, Habari)",
         "pathway_err":         "Ti wegwaru. Thura 1, 2, kana 3.",
         "pathway_msg":         "Njia Yoneneirwo: {pathway}\nKulingana na mbari yako ya Kiwango 9.\nCookia CAREERS kuona mirimo inayolingana.",
         "rate_math":           "Thura utendaji wako wa Hisabati:\n{opts}",
@@ -399,30 +487,44 @@ UI = {
         "all_career_footer":   "\nCookia 1-10 guthura.",
         "no_pathway":          "Ithoma mbere. Cookia START.",
         "invalid_career":      "Ti wegwaru. Cookia nambari kutoka orodha ya mirimo.",
-        "career_detail":       "━━━━━━━━━━━━━━━━━━━━\nMURIMO: {name}\n━━━━━━━━━━━━━━━━━━━━\n\nHitaji Sokoni: {demand} ya nafasi zose Kenya 2025\nMwelekeo: {trend}\n\n📚 Masomo:\n{subjects}\n\n🏫 Vyuo:\n{unis}\n\n📋 Mahitaji ya CBE:\n{reqs}\n\n✅ Niikuura!\nCookia START gutomia au MENU gũthiĩ.",
-        "ussd_career_end":     "✅ {name}\nHitaji: {demand} | {trend}\n\n📚 Masomo:\n{subjects}\n\n🏫 Vyuo:\n{unis}\n\n📋 Mahitaji ya CBE:\n{reqs}\n\n📱 Maelezo kamili + ushauri\nkwa SMS yako sasa!",
+        "career_detail":       "MURIMO: {name}\n\nHitaji Sokoni: {demand} ya nafasi zose Kenya 2025\nMwelekeo: {trend}\n\nMasomo:\n{subjects}\n\nVyuo:\n{unis}\n\nMahitaji ya CBE:\n{reqs}\n\nNiikuura!\nCookia START gutomia au MENU gũthiĩ.",
+        "ussd_career_end":     "{name}\nHitaji: {demand} | {trend}\n\nMasomo:\n{subjects}\n\nVyuo:\n{unis}\n\nMahitaji ya CBE:\n{reqs}\n\nMaelezo kamili na ushauri kwa SMS yako sasa!",
         "tracking_hdr":        "Mahitio: {grade} | {term}\n",
         "suggestion":          "{suggestions}\nUnaweza pia kuuliza swali lolote la CBE!",
-        "ussd_jss_result":     "{grade} | {term}\nNzuri: {strongest}\nIthomia zaidi: {weak}\n\n📱 Ũhoro mũno kwa SMS!\n\n1. Thomia Rĩngĩ\n2. Rũa",
+        "ussd_jss_result":     "{grade} | {term}\nNzuri: {strongest}\nIthomia zaidi: {weak}\n\nŨhoro mũno kwa SMS!\n\n1. Thomia Rĩngĩ\n2. Rũa",
         "ussd_pathway_result": "Njia ya CBE: {pathway}\nNzuri: {top}\nMbari: {summary}\n\n1. Ona Mirimo Inayolingana\n2. Ona Mirimo Yothe\n3. Thomia Rĩngĩ\n4. Rũa",
         "ussd_rag_menu":       "Msaidizi wa CBE\nJibu kwa SMS\n\nThura mada:\n1. CBE/CBC ni nini?\n2. Njia zimeelezwa\n3. Jinsi ya portfolio\n4. CBE vs 844\n5. Chuo kikuu na CBE\n6. Uliza swali lako (SMS)",
-        "ussd_rag_sending":    "✅ Jibu riaku rinaandaliwa\nna rigatumirwo kwa SMS.\n\nPiga simu rĩngĩ wakati wowote!",
+        "ussd_rag_sending":    "Jibu riaku rinaandaliwa na rigatumirwo kwa SMS.\n\nPiga simu rĩngĩ wakati wowote!",
         "ussd_rag_sms_tip":    "Kuuliza swali lako:\nTuma START, thura 2,\nandika swali la CBE.",
         "done":                "Niikuura. Cookia CAREERS kana uiguithia swali la CBE!",
         "paused":              "Bado imesimamishwa. Cookia RESUME kuendelea.",
         "thank_you":           "Nĩ wega ũgĩtumia EduTena CBE. Kila la heri!",
         "error":               "Kũheo gũtũkite. Gerera rĩngĩ.",
         "resume_fallback":     "Cookia START gũthomia tathmini yaku.",
-        "rag_welcome":         "Msaidizi wa CBE arĩ ũhoro!\nNiiguithia ũũ wowote:\n- Masomo & njia cia CBE\n- Uthuri wa ũthuri\n- Jinsi CBE inavyofanya kazi\n\nAndika swali riaku.\nCookia MENU gũthiĩ.",
+        "rag_welcome":         "Msaidizi wa CBE arĩ ũhoro!\nNiiguithia ũũ wowote:\n- Masomo na njia cia CBE\n- Uthuri wa ũthuri\n- Jinsi CBE inavyofanya kazi\n\nAndika swali riaku.\nCookia MENU gũthiĩ.",
         "rag_menu_reminder":   "Cookia MENU gũthiĩ menyu kuu.",
     },
 }
 
 
 def t(lang: str, key: str, **kwargs) -> str:
-    """Translate key to lang; fall back to English; support format kwargs."""
     text = UI.get(lang, UI["en"]).get(key) or UI["en"].get(key, f"[{key}]")
     return text.format(**kwargs) if kwargs else text
+
+
+# =============================================================
+#  STRIP MARKDOWN ASTERISKS FROM GEMINI RESPONSES
+# =============================================================
+
+def clean_gemini_response(text: str) -> str:
+    """Remove markdown asterisks (bold/italic) from Gemini output for plain SMS/USSD."""
+    if not text:
+        return text
+    # Remove bold (**text**) and italic (*text*) markers, keep the inner text
+    text = re.sub(r'\*{1,3}(.+?)\*{1,3}', r'\1', text, flags=re.DOTALL)
+    # Remove any leftover lone asterisks
+    text = text.replace('*', '')
+    return text.strip()
 
 
 # =============================================================
@@ -452,15 +554,14 @@ CBE Structure:
 CRITICAL LANGUAGE RULE: {_lang_instruction(lang)}
 Never switch language mid-response. If the student chose Kiswahili, every word must be Kiswahili.
 
+FORMATTING RULE: Do NOT use markdown. Do not use asterisks, bold, or italic formatting.
+Write in plain conversational text only. Use plain dashes or numbers for lists.
+
 OTHER RULES:
 - Be warm, speak like a trusted Kenyan teacher or older sibling
 - Never give medical, legal or financial investment advice
 - Write as many sentences as needed — do NOT truncate your answer
 - If asked something completely unrelated to CBE/education, politely redirect
-"""
-
-DOCUMENT_CONTEXT = """
-[CBE curriculum document context will be injected here once linked.]
 """
 
 CBE_ASSISTANT_SYSTEM = """\
@@ -475,12 +576,16 @@ You can help with:
 - How to prepare a CBE portfolio for university entry
 - Understanding CBE vs the old 844 system
 - Advice for parents
+- Questions about set books including The Last Laugh (Grade 9)
 
 DOCUMENT CONTEXT:
 {document_context}
 
 CRITICAL LANGUAGE RULE: {lang_instruction}
 Never switch language mid-response.
+
+FORMATTING RULE: Do NOT use markdown. Do not use asterisks, bold, or italic formatting.
+Write in plain conversational text only. Use plain dashes or numbers for lists.
 
 OTHER RULES:
 - Be warm, speak like a trusted Kenyan teacher
@@ -508,7 +613,8 @@ async def gemini_call(prompt: str, max_tokens: int, temperature: float, label: s
             if not candidates: print(f"[{label}] empty candidates: {data}"); return None
             c = candidates[0]
             if c.get("finishReason") == "SAFETY": return "__SAFETY__"
-            return c["content"]["parts"][0]["text"].strip()
+            raw = c["content"]["parts"][0]["text"].strip()
+            return clean_gemini_response(raw)
     except Exception as e:
         print(f"[{label}] {type(e).__name__}: {e}"); return None
 
@@ -533,6 +639,7 @@ async def gemini_career_narrative(grade, pathway, career, subjects, demand, lang
         f"3. Give 2-3 concrete next steps they can take in school right now\n"
         f"4. Name the specific subjects they must focus on and why each matters\n"
         f"5. End with genuine encouragement mentioning the Kenya job market opportunity\n\n"
+        f"Write in plain text — no asterisks, no bold, no markdown formatting.\n"
         f"Write as many sentences as needed. Do NOT be generic. Be warm and Kenyan.\n\nMessage:"
     )
     a = await gemini_call(prompt, 700, 0.7, "career_narrative")
@@ -559,6 +666,7 @@ async def gemini_jss_suggestions(grade, term, math, science, social, creative, t
         f"2. For each subject at Approaching/Below Expectation: name it, explain why it matters "
         f"in CBE, give 2-3 specific daily study tips, suggest a free Kenyan resource\n"
         f"3. Close with motivation connecting their grade to Senior pathway options\n\n"
+        f"Write in plain text — no asterisks, no bold, no markdown formatting.\n"
         f"Write as many sentences as needed. Give real, specific advice.\n\nMessage:"
     )
     a = await gemini_call(prompt, 900, 0.6, "jss_suggestions")
@@ -579,7 +687,7 @@ async def ask_gemini(phone, question, lang="en", context_state="", channel="sms"
         f"{cbe_system_prompt(lang)}{flow}\n"
         f"CONVERSATION HISTORY:\n{history}\n"
         f"STUDENT QUESTION: {question}\n\n"
-        f"Answer fully and clearly — do not truncate. End with: '{resume}'"
+        f"Answer fully and clearly — do not truncate. Write in plain text, no asterisks or markdown. End with: '{resume}'"
     )
     a = await gemini_call(prompt, 900, 0.4, "ask_gemini")
     if not a or a == "__SAFETY__": return t(lang, "resume_fallback")
@@ -596,13 +704,13 @@ async def ask_gemini_rag(phone, question, lang) -> str:
     if not GEMINI_KEY: return t(lang, "done")
     history = "".join(f"{r.upper()}: {m}\n" for r, m in get_chat_history(phone, 8))
     doc = (f"\nREFERENCE DOCUMENTS:\n{DOCUMENT_CONTEXT}\n"
-           if DOCUMENT_CONTEXT.strip() and not DOCUMENT_CONTEXT.strip().startswith("[")
+           if DOCUMENT_CONTEXT.strip() and not DOCUMENT_CONTEXT.strip().startswith("(")
            else "(No documents linked yet — use your CBE knowledge.)")
     system = CBE_ASSISTANT_SYSTEM.format(document_context=doc, lang_instruction=_lang_instruction(lang))
     prompt = (
         f"{system}\n\nCONVERSATION HISTORY:\n{history}\n"
         f"STUDENT: {question}\n\n"
-        f"EDUTENA — answer fully. Never truncate. "
+        f"EDUTENA — answer fully. Never truncate. Write in plain text, no asterisks or markdown. "
         f"End with: '{t(lang, 'rag_menu_reminder')}'"
     )
     a = await gemini_call(prompt, 1600, 0.5, "rag_chat")
@@ -713,7 +821,6 @@ def get_career_ussd_list(pathway):
     return lines + "7. More careers"
 
 def get_career_ussd_end(pathway, career_idx, lang):
-    """Full career detail on USSD END screen — mirrors SMS detail."""
     careers = SENIOR_CAREERS.get(pathway, SENIOR_CAREERS["STEM"])
     if career_idx < 0 or career_idx >= len(careers): return t(lang, "invalid_career")
     name, demand, trend, subjects, unis, reqs = careers[career_idx]
@@ -952,7 +1059,6 @@ def con(text): return f"CON {text}"
 def end(text): return f"END {text}"
 
 def ussd_lang_screen():
-    # Bilingual so ALL users can identify their language
     return con("Welcome / Karibu\nEduTena CBE\n\nChagua / Select:\n1. English\n2. Kiswahili\n3. Kiluhya\n4. Gĩkũyũ")
 
 
@@ -970,7 +1076,7 @@ async def _sms_career_detail(phone, pathway, career_idx, lang, grade):
 async def _sms_jss_suggestions(phone, grade, term, math, sci, soc, cre, tec, lang):
     try:
         suggestions = await gemini_jss_suggestions(grade, term, math, sci, soc, cre, tec, lang)
-        msg = (f"EduTena CBE — {grade} | {term}\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        msg = (f"EduTena CBE — {grade} | {term}\n\n"
                + t(lang,"suggestion", suggestions=suggestions)
                + "\n\n" + t(lang,"resume_fallback"))
         await send_reply(phone, msg)
@@ -978,10 +1084,10 @@ async def _sms_jss_suggestions(phone, grade, term, math, sci, soc, cre, tec, lan
 
 async def _sms_rag_answer(phone, question, lang):
     try:
-        header = {"en":"EduTena CBE Assistant\n━━━━━━━━━━━━━━━━━━━━\n\n",
-                  "sw":"Msaidizi wa EduTena CBE\n━━━━━━━━━━━━━━━━━━━━\n\n",
-                  "lh":"Msaidizi wa EduTena CBE\n━━━━━━━━━━━━━━━━━━━━\n\n",
-                  "ki":"Msaidizi wa EduTena CBE\n━━━━━━━━━━━━━━━━━━━━\n\n"}.get(lang,"")
+        header = {"en":"EduTena CBE Assistant\n\n",
+                  "sw":"Msaidizi wa EduTena CBE\n\n",
+                  "lh":"Msaidizi wa EduTena CBE\n\n",
+                  "ki":"Msaidizi wa EduTena CBE\n\n"}.get(lang,"")
         await send_reply(phone, header + await ask_gemini_rag(phone, question, lang))
     except Exception as e: print(f"[USSD SMS RAG] {e}")
 
@@ -1095,7 +1201,7 @@ async def ussd_callback(
                 ussd_save(phone,"pathway",pw); ussd_save(phone,"state","RESULT")
                 scores_d = {"Math":m or 0,"Science":sci or 0,"Social":so or 0,"Creative":cr or 0,"Technical":tc or 0}
                 top2 = sorted(scores_d.items(), key=lambda x:-x[1])[:2]
-                top_str = " & ".join(n for n,_ in top2)
+                top_str = " and ".join(n for n,_ in top2)
                 return con(t(lang,"ussd_pathway_result", pathway=pw, top=top_str, summary=score_summary(m,sci,so,cr,tc)))
             else:
                 asyncio.create_task(_sms_jss_suggestions(phone,gr,tv,m,sci,so,cr,tc,lang))
@@ -1126,7 +1232,6 @@ async def ussd_callback(
                 ussd_save(phone,"career_interest",SENIOR_CAREERS[pw][idx][0])
                 ussd_save(phone,"state","DONE")
                 asyncio.create_task(_sms_career_detail(phone,pw,idx,lang,student[3] or ""))
-                # Show full detail on USSD END screen (same structure as SMS)
                 return end(get_career_ussd_end(pw,idx,lang))
             elif step=="7":
                 careers = SENIOR_CAREERS.get(pw,[])
